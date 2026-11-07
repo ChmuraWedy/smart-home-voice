@@ -4,12 +4,18 @@ import asyncio
 import json
 import math
 import re
+import time
+from datetime import datetime, timezone
 from urllib.parse import quote
 
 import httpx
 
 CHANNEL = re.compile(r"switch_[1-9][0-9]*")
 SCALAR_TYPES = {"boolean", "integer", "number", "string"}
+AUTO_CONTROL_CATEGORIES = {"dj", "dd", "kg", "cz"}
+AUTO_REFRESH_INTERVAL = 300
+_last_refresh = float("-inf")
+_last_topology_sync = float("-inf")
 
 
 def tool(name, description, properties):
@@ -25,6 +31,11 @@ def tool(name, description, properties):
 TARGETS = {"device_ids": {"type": "array", "items": {"type": "string"}}}
 CAPABILITY = {"capability": {"type": ["string", "null"]}}
 TOOLS = [
+    tool("room_lights", "Read or set the lights in one exact Smart Life room; null reads power.", {
+        "room": {"type": "string"},
+        "home": {"type": ["string", "null"]},
+        "on": {"type": ["boolean", "null"]},
+    }),
     tool("get_device_status", "Read current device or channel state; use null for all readings.", {
         **TARGETS, **CAPABILITY,
     }),
@@ -105,17 +116,67 @@ async def refresh_cloud_definitions(backend, remote):
             f"cloud/devices/{quote(remote['id'], safe='')}/functions",
             params={"provider": "sharing"},
         ))
+        remote["controls"]["ready"] = True
     except (httpx.HTTPError, ValueError):
         pass
 
 
-async def load_catalog(backend, labels, cloud_ids, cloud_labels=None):
+async def fetch_cloud(backend, auto_tuya):
+    global _last_refresh
+    params = {"provider": "sharing"}
+    refresh = auto_tuya and time.monotonic() - _last_refresh >= AUTO_REFRESH_INTERVAL
+    if refresh:
+        _last_refresh = time.monotonic()
+        try:
+            return result_json(await backend.get("cloud/devices", params={**params, "refresh": "true"}))
+        except (httpx.HTTPError, ValueError):
+            pass
+    return result_json(await backend.get("cloud/devices", params=params, timeout=5))
+
+
+async def room_placements(backend):
+    global _last_topology_sync
+    try:
+        topology = result_json(await backend.get("cloud/topology"))
+        timestamp = topology.get("synced_at")
+        stale = not timestamp or (datetime.now(timezone.utc) - datetime.fromisoformat(timestamp)).days >= 1
+        if (stale and topology["job"]["status"] != "running"
+                and time.monotonic() - _last_topology_sync >= AUTO_REFRESH_INTERVAL):
+            _last_topology_sync = time.monotonic()
+            await backend.post("cloud/topology/sync", timeout=4)
+        rooms = result_json(await backend.get("rooms", params={"limit": 500}))
+    except (httpx.HTTPError, ValueError):
+        return {}
+    room_names = {room["id"]: room["name"] for room in rooms}
+    homes = {home["home_id"]: home["name"] for home in topology["homes"]}
+    return {
+        row["device_id"]: (
+            (row["home_id"], row["cloud_room_id"]), homes[row["home_id"]], room_names[row["room_id"]],
+        )
+        for row in topology["placements"]
+        if row["home_id"] in homes and row["room_id"] in room_names
+    }
+
+
+def apply_room(device, remote, placement, room_names):
+    if not placement:
+        return
+    device["room_key"], device["home"], device["room"] = placement
+    name = remote["name"].casefold().strip()
+    room = device["room"].casefold()
+    # Some fixtures retain a different room name in Smart Life. Require an
+    # explicit device name for these and for extractors that report as bulbs.
+    device["room_light"] = (
+        remote["category"] == "dj" and not any(word in name for word in ("extract", "hood", "fan"))
+        and not any(other != room and name.startswith(other + " ") for other in room_names)
+    )
+
+
+async def load_catalog(backend, labels, cloud_ids, cloud_labels=None, *, auto_tuya=False):
     cloud_labels = cloud_labels or {}
     rows = result_json(await backend.get("devices")) if labels else []
     try:
-        cloud = {row["id"]: row for row in result_json(await backend.get(
-            "cloud/devices", params={"provider": "sharing"}, timeout=4,
-        ))}
+        cloud = {row["id"]: row for row in await fetch_cloud(backend, auto_tuya)}
     except (httpx.HTTPError, ValueError):
         cloud = {}
 
@@ -125,6 +186,8 @@ async def load_catalog(backend, labels, cloud_ids, cloud_labels=None):
     }
     await asyncio.gather(*(refresh_cloud_definitions(backend, cloud[ident])
                            for ident in cloud_targets if ident in cloud))
+    placements = await room_placements(backend) if auto_tuya and cloud else {}
+    room_names = {placement[2].casefold() for placement in placements.values()}
     catalog = {}
     for row in rows:
         ident = str(row["id"])
@@ -136,11 +199,19 @@ async def load_catalog(backend, labels, cloud_ids, cloud_labels=None):
             row = {**row, "capabilities": {}}
         path = f"cloud/devices/{quote(row['device_id'], safe='')}" if use_cloud else f"devices/{ident}"
         catalog[ident] = catalog_entry(labels[ident], row, remote, path, use_cloud)
-    for index, (device_id, name) in enumerate(cloud_labels.items(), start=1):
+        if remote:
+            apply_room(catalog[ident], remote, placements.get(row["device_id"]), room_names)
+    discover = {ident: remote["name"] for ident, remote in cloud.items()} if auto_tuya else {}
+    for index, (device_id, name) in enumerate({**discover, **cloud_labels}.items(), start=1):
         remote = cloud.get(device_id)
         if remote and device_id not in configured:
             path = f"cloud/devices/{quote(device_id, safe='')}"
-            catalog[f"cloud-{index}"] = catalog_entry(name, remote, remote, path, True)
+            device = catalog_entry(name, remote, remote, path, True)
+            device["remote"] = remote
+            device["category"] = remote["category"]
+            device["read_only"] = device_id not in cloud_labels and remote["category"] not in AUTO_CONTROL_CATEGORIES
+            apply_room(device, remote, placements.get(device_id), room_names)
+            catalog[f"cloud-{index}"] = device
     return catalog
 
 
@@ -155,10 +226,11 @@ def model_catalog(catalog):
     return {
         ident: {
             "name": device["name"], "aliases": device["aliases"], "channels": device["channels"],
+            **{key: device[key] for key in ("room", "home", "room_light", "category", "read_only") if key in device},
             "controls": {
                 code: {
                     **{field: spec[field] for field in fields if spec.get(field) is not None},
-                    "writable": can_write(spec),
+                    "writable": not device.get("read_only") and can_write(spec),
                 }
                 for code, spec in device["capabilities"].items()
             },
@@ -266,11 +338,50 @@ async def read_status(backend, device, code):
     return f"{name}: {', '.join(values)}." if values else f"No current reading for {name}."
 
 
+async def hydrate_device(backend, device):
+    remote = device.get("remote")
+    if remote and not remote["controls"].get("ready"):
+        await refresh_cloud_definitions(backend, remote)
+        device.update(catalog_entry(device["name"], remote, remote, device["path"], True))
+
+
+def power_code(device):
+    specs = device["capabilities"]
+    power = [code for code, spec in specs.items()
+             if spec["type"] == "boolean" and (code in ("switch_led", "switch") or CHANNEL.fullmatch(code))]
+    return next((code for code in ("switch_led", "switch") if code in power),
+                power[0] if len(power) == 1 else "power")
+
+
+async def room_lights(backend, catalog, args):
+    room, home, on = args["room"], args["home"], args["on"]
+    if not isinstance(room, str) or (home is not None and not isinstance(home, str)):
+        raise ValueError("Invalid room")
+    if on is not None and type(on) is not bool:
+        raise ValueError("Invalid power value")
+    candidates = [
+        device for device in catalog.values()
+        if device.get("room", "").casefold() == room.strip().casefold()
+        and (home is None or device["home"].casefold() == home.strip().casefold())
+    ]
+    if len({device["room_key"] for device in candidates}) > 1:
+        return [f"More than one Smart Life room is named {room}. Include the home name."]
+    devices = [device for device in candidates if device["room_light"]]
+    if not devices:
+        return [f"No lights found in the Smart Life room {room}."]
+    await asyncio.gather(*(hydrate_device(backend, device) for device in devices))
+    if on is None:
+        return await asyncio.gather(*(read_status(backend, device, power_code(device)) for device in devices))
+    return await set_controls(backend, devices, "power", on, "value")
+
+
 async def execute(backend, catalog, call):
     name = call["name"]
     if name not in {tool["name"] for tool in TOOLS}:
         raise ValueError("Unknown tool")
     args = json.loads(call["arguments"])
+    if name == "room_lights":
+        return await room_lights(backend, catalog, args)
     ids = args["device_ids"]
     if (
         not isinstance(ids, list) or not ids
@@ -278,12 +389,14 @@ async def execute(backend, catalog, call):
     ):
         raise ValueError("Unknown device")
     devices = [catalog[ident] for ident in dict.fromkeys(ids)]
+    await asyncio.gather(*(hydrate_device(backend, device) for device in devices))
     if name == "get_device_controls":
         messages = []
         for device in devices:
             controls = ", ".join(
                 label_for(device, code)
-                for code, spec in device["capabilities"].items() if can_write(spec)
+                for code, spec in device["capabilities"].items()
+                if not device.get("read_only") and can_write(spec)
             )
             messages.append(f"{device['name']}: {controls or 'no writable controls are mapped'}.")
         return messages
@@ -301,22 +414,31 @@ async def execute(backend, catalog, call):
     if code is not None and (not isinstance(code, str) or not 0 < len(code) <= 128):
         raise ValueError("Invalid capability")
     if name == "get_device_status":
-        return await asyncio.gather(*(read_status(backend, device, code) for device in devices))
+        return await asyncio.gather(*(read_status(
+            backend, device, power_code(device) if code == "power" else code,
+        ) for device in devices))
+    return await set_controls(backend, devices, code, args["value"], args["format"])
 
+
+async def set_controls(backend, devices, requested_code, requested_value, value_format):
     writes, messages = [], []
     for device in devices:
+        if device.get("read_only"):
+            messages.append(f"{device['name']} is available for voice status only.")
+            continue
+        code = power_code(device) if requested_code == "power" else requested_code
         spec = device["capabilities"].get(code)
         if not spec or not can_write(spec):
             messages.append(f"{device['name']} has no writable {code} mapping.")
             continue
         try:
-            value = checked_value(spec, args["value"], args["format"])
+            value = checked_value(spec, requested_value, value_format)
         except ValueError as error:
             messages.append(f"{device['name']}: {code} {error}.")
             continue
-        writes.append((device, spec, value))
+        writes.append((device, code, spec, value))
 
-    for device, spec, value in writes:
+    for device, code, spec, value in writes:
         path = device["path"]
         if device["cloud"]:
             url, body = f"{path}/commands", {"commands": [{"code": code, "value": value}]}

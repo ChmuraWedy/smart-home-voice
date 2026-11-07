@@ -67,6 +67,9 @@ async def interpret(audio, media_type, key, catalog):
                 "select its specific switch_N code. Use switch or switch_led for device power, "
                 "and brightness or an advertised bright_value code for light level. "
                 "Room light groups include only lights. Select an extractor only when requested. "
+                "For a room's lights as a group, always use room_lights with the exact room and home "
+                "from the catalog; null on means read. For explicit named devices, use device tools. "
+                "Use capability power for on/off when the device controls have not been loaded. "
                 "Use get_aliases for device or channel names, get_device_controls for supported "
                 "commands, and get_device_status for readings. "
                 "Only write for an explicit request. Do not change every channel when one is ambiguous. "
@@ -92,11 +95,12 @@ async def command(request: Request):
     key = secret("OPENAI_API_KEY")
     try:
         labels = json.loads(os.getenv("VOICE_DEVICES") or os.getenv("VOICE_LIGHTS") or "{}")
+        auto_tuya = os.getenv("VOICE_AUTO_TUYA") == "1"
         cloud_labels = json.loads(os.getenv("VOICE_CLOUD_DEVICES") or "{}")
         cloud_ids = {part.strip() for part in os.getenv("VOICE_CLOUD_IDS", "").split(",") if part.strip()}
         if not isinstance(labels, dict) or not isinstance(cloud_labels, dict):
             raise TypeError
-        if not (labels or cloud_labels) or not cloud_ids <= labels.keys():
+        if not (labels or cloud_labels or auto_tuya) or not cloud_ids <= labels.keys():
             raise ValueError
         if any(not isinstance(label, str) or not label.strip()
                for label in (*labels.values(), *cloud_labels.values())):
@@ -129,10 +133,12 @@ async def command(request: Request):
         timeout=15,
     ) as backend:
         try:
-            catalog = await load_catalog(backend, labels, cloud_ids, cloud_labels)
+            catalog = await load_catalog(backend, labels, cloud_ids, cloud_labels, auto_tuya=auto_tuya)
             transcript, calls = await interpret(bytes(audio), media_type, key, catalog)
         except (httpx.HTTPError, ValueError, TypeError, KeyError, AttributeError):
             raise HTTPException(502, "Could not load the device catalog or interpret the recording.") from None
+        if not catalog:
+            return {"transcript": transcript, "message": "No voice devices are available in the current inventory."}
         if not calls:
             message = ("Name a configured device or channel and ask for aliases, status, or a change."
                        if transcript else "No speech detected. Try again.")

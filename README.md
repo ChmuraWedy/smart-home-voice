@@ -28,6 +28,7 @@ starting the voice app.
 | `VOICE_DEVICES` | JSON object mapping allowed numeric inventory IDs to voice names, e.g. `{"12":"kitchen light","14":"workroom switch"}`. Falls back to the legacy `VOICE_LIGHTS` setting. |
 | `VOICE_CLOUD_IDS` | Optional comma-separated subset of those IDs to route through the connected Tuya Sharing account. Other devices use the local API. |
 | `VOICE_CLOUD_DEVICES` | Optional JSON map of Tuya Sharing device IDs to voice names for devices outside the local inventory. Only devices in the connected Sharing account can be selected. |
+| `VOICE_AUTO_TUYA` | Set to `1` to discover the connected Tuya Sharing inventory and use the synced Smart Life home and room assignments. No device ID map is required in this mode. |
 | `VOICE_BACKEND_URL` | Backend base URL, defaults to `http://127.0.0.1:8000` |
 | `SMART_HOME_API_TOKEN` | Backend API token, if configured |
 | `VOICE_MODEL` | Optional function-calling model override |
@@ -35,6 +36,14 @@ starting the voice app.
 Use IDs from the backend's `GET /api/v1/devices` response. Devices without
 capability mappings can still be named and looked up. Channel aliases come from
 the connected Tuya Sharing catalog and resolve to their specific `switch_N` code.
+
+Automatic mode refreshes the Tuya inventory on voice use at most every five minutes
+and requests a topology sync when the room snapshot is over a day old. Explicit
+device settings can still supply a preferred voice name or local transport.
+Automatically discovered lights, wired switches and plugs can use mapped controls.
+Other categories are available for status. Room light commands use the exact home
+and room and leave extractors and fixtures with a different room prefix available
+by individual name.
 
 ```sh
 python -m uvicorn app:app --host 127.0.0.1 --port 8011
@@ -101,7 +110,8 @@ microphone access. Check a configured light with an on or off command.
 
 The Compose file uses Linux host networking to reach the existing backend at
 `127.0.0.1:8000`. Build the image with `docker build -t "$VOICE_IMAGE" .`.
-Set `VOICE_IMAGE`, `VOICE_DEVICES`, and `VOICE_SECRETS_DIR` before running
+Set `VOICE_IMAGE`, `VOICE_SECRETS_DIR`, and either `VOICE_AUTO_TUYA=1` or an
+explicit device map before running
 `docker compose up -d --wait`.
 
 Put `voice.crt`, `voice.key`, `password`, `openai-key`, and `backend-token`

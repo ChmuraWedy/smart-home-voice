@@ -20,6 +20,7 @@ services:
       VOICE_DEVICES: "${VOICE_DEVICES:-}"
       VOICE_CLOUD_IDS: "${VOICE_CLOUD_IDS:-}"
       VOICE_CLOUD_DEVICES: "${VOICE_CLOUD_DEVICES:-}"
+      VOICE_AUTO_TUYA: "${VOICE_AUTO_TUYA:-0}"
       OPENAI_API_KEY_FILE: /run/secrets/openai_key
       SMART_HOME_API_TOKEN_FILE: /run/secrets/backend_token
       VOICE_PASSWORD_FILE: /run/secrets/voice_password
