@@ -3,7 +3,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY --chmod=0444 app.py index.html ./
+COPY --chmod=0444 app.py controls.py index.html ./
 USER 10001:10001
 EXPOSE 8011
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8011"]

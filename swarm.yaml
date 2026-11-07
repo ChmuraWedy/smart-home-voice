@@ -16,7 +16,9 @@ services:
       - /run/secrets/tls_key
     environment:
       VOICE_BACKEND_URL: "${VOICE_BACKEND_URL:?Set the reachable smart-home API URL}"
-      VOICE_LIGHTS: "${VOICE_LIGHTS:?Set the light ID map}"
+      VOICE_LIGHTS: "${VOICE_LIGHTS:-}"
+      VOICE_DEVICES: "${VOICE_DEVICES:-}"
+      VOICE_CLOUD_IDS: "${VOICE_CLOUD_IDS:-}"
       OPENAI_API_KEY_FILE: /run/secrets/openai_key
       SMART_HOME_API_TOKEN_FILE: /run/secrets/backend_token
       VOICE_PASSWORD_FILE: /run/secrets/voice_password

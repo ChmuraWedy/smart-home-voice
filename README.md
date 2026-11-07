@@ -2,9 +2,17 @@
 
 A separate one-button browser app for smart-home-service. Tap to start recording,
 then tap again to send. The app also sends automatically after 15 seconds.
-OpenAI transcribes the audio and returns a function call. The app can only turn
-configured lights on or off or check their state. It displays the transcript and
-backend result and reads the result aloud in browsers that support speech synthesis.
+OpenAI transcribes the audio and selects tools from the registered device catalog.
+Ask for device status, saved device or channel aliases, supported controls, or
+changes such as power, level, color, mode, or a timer. The app displays the transcript
+and backend result and reads the result aloud in browsers that support speech synthesis.
+
+Commands use the selected device's effective definitions. Local controls accept
+mapped Boolean, numeric, string/enum, and encoded HSV values. Tuya Sharing controls
+accept advertised Boolean, integer, and enum values. The app validates ranges,
+steps, and choices, then the backend validates and encodes the request again.
+Raw payloads and vendor-specific schedules and scenes are outside the voice tools.
+An accepted command is reported separately from a live status reading.
 
 ## Run locally
 
@@ -17,13 +25,15 @@ starting the voice app.
 | --- | --- |
 | `OPENAI_API_KEY` | OpenAI project API key |
 | `VOICE_PASSWORD` | A unique password for the voice page |
-| `VOICE_LIGHTS` | JSON object mapping existing numeric device IDs to clear room and light names, e.g. `{"12":"living room ceiling light","14":"living room floor lamp"}` |
+| `VOICE_DEVICES` | JSON object mapping allowed numeric inventory IDs to voice names, e.g. `{"12":"kitchen light","14":"workroom switch"}`. Falls back to the legacy `VOICE_LIGHTS` setting. |
+| `VOICE_CLOUD_IDS` | Optional comma-separated subset of those IDs to route through the connected Tuya Sharing account. Other devices use the local API. |
 | `VOICE_BACKEND_URL` | Backend base URL, defaults to `http://127.0.0.1:8000` |
 | `SMART_HOME_API_TOKEN` | Backend API token, if configured |
 | `VOICE_MODEL` | Optional function-calling model override |
 
-Use device IDs from the existing backend's `GET /api/v1/devices` response.
-Include lights with a configured `switch` or `switch_led` capability.
+Use IDs from the backend's `GET /api/v1/devices` response. Devices without
+capability mappings can still be named and looked up. Channel aliases come from
+the connected Tuya Sharing catalog and resolve to their specific `switch_N` code.
 
 ```sh
 python -m uvicorn app:app --host 127.0.0.1 --port 8011
@@ -90,7 +100,7 @@ microphone access. Check a configured light with an on or off command.
 
 The Compose file uses Linux host networking to reach the existing backend at
 `127.0.0.1:8000`. Build the image with `docker build -t "$VOICE_IMAGE" .`.
-Set `VOICE_IMAGE`, `VOICE_LIGHTS`, and `VOICE_SECRETS_DIR` before running
+Set `VOICE_IMAGE`, `VOICE_DEVICES`, and `VOICE_SECRETS_DIR` before running
 `docker compose up -d --wait`.
 
 Put `voice.crt`, `voice.key`, `password`, `openai-key`, and `backend-token`
