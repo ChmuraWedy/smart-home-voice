@@ -32,8 +32,18 @@ TOOL = {
 }
 
 
+def secret(name):
+    path = os.getenv(f"{name}_FILE")
+    return Path(path).read_text().rstrip("\r\n") if path else os.getenv(name)
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
 def authenticate(credentials: HTTPBasicCredentials = Depends(basic)):
-    password = os.getenv("VOICE_PASSWORD")
+    password = secret("VOICE_PASSWORD")
     if not password:
         raise HTTPException(503, "Set VOICE_PASSWORD on the server.")
     if not secrets.compare_digest(credentials.password.encode(), password.encode()):
@@ -87,7 +97,7 @@ async def command(request: Request):
     # A cross-origin form cannot add this header, and this app does not allow CORS.
     if request.headers.get("x-voice-command") != "1":
         raise HTTPException(403, "Open the voice page to send a command.")
-    key = os.getenv("OPENAI_API_KEY")
+    key = secret("OPENAI_API_KEY")
     try:
         lights = json.loads(os.getenv("VOICE_LIGHTS", "{}"))
         if not isinstance(lights, dict) or not lights or not all(
@@ -132,7 +142,7 @@ async def command(request: Request):
     except (httpx.HTTPError, ValueError, TypeError, KeyError, AttributeError):
         raise HTTPException(502, "Could not interpret the recording. No command was sent.") from None
 
-    token = os.getenv("SMART_HOME_API_TOKEN")
+    token = secret("SMART_HOME_API_TOKEN")
     headers = {"X-API-Key": token} if token else {}
     state = "on" if on else "off"
     confirmed, unconfirmed = [], []
