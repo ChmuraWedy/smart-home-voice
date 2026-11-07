@@ -1,6 +1,7 @@
 """Standalone LAN voice interface for smart-home-service."""
 
 import json
+import logging
 import os
 import re
 import secrets
@@ -16,6 +17,7 @@ from controls import TOOLS, execute, load_catalog, model_catalog, result_json
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 basic = HTTPBasic()
+logger = logging.getLogger("uvicorn.error")
 FORMATS = {
     "audio/webm": "webm", "audio/mp4": "mp4", "audio/ogg": "ogg", "audio/wav": "wav",
 }
@@ -72,7 +74,15 @@ async def interpret(audio, media_type, key, catalog):
                 "Use capability power for on/off when the device controls have not been loaded. "
                 "Use get_aliases for device or channel names, get_device_controls for supported "
                 "commands, and get_device_status for readings. "
+                "For why a device is on or off, use get_power_history. "
+                "For a light color request use set_light_color with its advertised color control. "
+                "When the user asks to change both power and color, include both in that single call. "
                 "Only write for an explicit request. Do not change every channel when one is ambiguous. "
+                "A number alone is ambiguous when more than one room has a light with that number. "
+                "An imperative to turn something on or off or change a setting is a write request, "
+                "in any language. Never substitute a status check for a requested change. "
+                "Use explain_no_action when the request is unclear, unsupported, or missing a "
+                "device or value. Do not combine it with device operations. "
                 "For each distinct capability issue a separate call. Use format=percent for explicit "
                 "percentages and format=value for Boolean, enum, HSV or exact API-unit values. "
                 "Cloud numeric metadata is in raw ticks; convert using cloud_scale when the units are "
@@ -81,6 +91,7 @@ async def interpret(audio, media_type, key, catalog):
             ),
             "input": transcript,
             "tools": TOOLS,
+            "tool_choice": "required",
         }))
     if response["status"] != "completed":
         raise ValueError("Incomplete model response")
@@ -146,10 +157,22 @@ async def command(request: Request):
         if len(calls) > 8:
             return {"transcript": transcript, "message": "Ask for fewer changes at a time."}
 
+        call_names = [call["name"] for call in calls]
+        logger.info("Voice request selected tools: %s", ", ".join(call_names))
+        if "explain_no_action" in call_names:
+            calls = [call for call in calls if call["name"] == "explain_no_action"][:1]
         messages = []
+        status_only = True
         for call in calls:
             try:
+                status_only = status_only and (
+                    call["name"] in ("get_device_status", "get_power_history")
+                    or (call["name"] == "room_lights" and json.loads(call["arguments"])["on"] is None)
+                )
                 messages.extend(await execute(backend, catalog, call))
             except (ValueError, TypeError, KeyError):
+                status_only = False
                 messages.append("Could not match one request to a configured device or control.")
+    if status_only:
+        messages.insert(0, "Status check only. No device command was sent.")
     return {"transcript": transcript, "message": " ".join(messages)}

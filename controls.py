@@ -30,7 +30,18 @@ def tool(name, description, properties):
 
 TARGETS = {"device_ids": {"type": "array", "items": {"type": "string"}}}
 CAPABILITY = {"capability": {"type": ["string", "null"]}}
+HSV = {
+    "type": "object",
+    "properties": {key: {"type": "integer"} for key in ("h", "s", "v")},
+    "required": ["h", "s", "v"], "additionalProperties": False,
+}
 TOOLS = [
+    tool("explain_no_action", "Report why no device operation can be safely selected.", {
+        "reason": {"type": "string", "enum": [
+            "unclear_request", "device_not_found", "ambiguous_target",
+            "unsupported_control", "missing_value",
+        ]},
+    }),
     tool("room_lights", "Read or set the lights in one exact Smart Life room; null reads power.", {
         "room": {"type": "string"},
         "home": {"type": ["string", "null"]},
@@ -39,18 +50,19 @@ TOOLS = [
     tool("get_device_status", "Read current device or channel state; use null for all readings.", {
         **TARGETS, **CAPABILITY,
     }),
+    tool("get_power_history", "Check current power and the latest accepted power command for a device.", TARGETS),
     tool("get_aliases", "List device aliases and named channels for the specified devices.", TARGETS),
     tool("get_device_controls", "List the available writable controls for the specified devices.", TARGETS),
+    tool("set_light_color", "Set mapped HSV light color and optionally power on or off in one command.", {
+        **TARGETS, "capability": {"type": "string"}, "color": HSV,
+        "on": {"type": ["boolean", "null"]},
+    }),
     tool("set_device_control", "Set one advertised writable capability on the selected devices.", {
         **TARGETS,
         "capability": {"type": "string"},
         "value": {"anyOf": [
             {"type": "boolean"}, {"type": "number"}, {"type": "string"},
-            {
-                "type": "object",
-                "properties": {key: {"type": "integer"} for key in ("h", "s", "v")},
-                "required": ["h", "s", "v"], "additionalProperties": False,
-            },
+            HSV,
         ]},
         "format": {"type": "string", "enum": ["value", "percent"]},
     }),
@@ -60,6 +72,21 @@ TOOLS = [
 def result_json(response):
     response.raise_for_status()
     return response.json()
+
+
+def hsv_limits(code, definition, limits):
+    if code not in ("colour_data", "colour_data_v2") or definition["type"] != "Json":
+        return None
+    if set(limits) != {"h", "s", "v"}:
+        return None
+    if not all(
+        isinstance(field, dict) and field.get("min") == 0 and field.get("step") == 1
+        and field.get("scale", 0) == 0
+        and field.get("max") in ((360,) if key == "h" else (255, 1000))
+        for key, field in limits.items()
+    ):
+        return None
+    return {key: field["max"] for key, field in limits.items()}
 
 
 def cloud_controls(cloud):
@@ -76,6 +103,13 @@ def cloud_controls(cloud):
                     limits = {}
             if not isinstance(limits, dict):
                 limits = {}
+            color = hsv_limits(code, definition, limits)
+            if color:
+                result[code] = {
+                    "type": "object", "encoding": "cloud_hsv", "cloud_hsv": color,
+                    "readable": True, "writable": kind == "functions",
+                }
+                continue
             value_type = {
                 "Boolean": "boolean", "Integer": "integer", "Enum": "string", "String": "string",
             }.get(definition["type"])
@@ -87,6 +121,11 @@ def cloud_controls(cloud):
                     "step": limits.get("step"), "enum": limits.get("range"),
                     "unit": limits.get("unit"), "cloud_scale": limits.get("scale", 0),
                 }
+    mode = result.get("work_mode", {})
+    if not mode.get("writable") or "colour" not in (mode.get("enum") or []):
+        for spec in result.values():
+            if "cloud_hsv" in spec:
+                spec["writable"] = False
     return result
 
 
@@ -375,11 +414,46 @@ async def room_lights(backend, catalog, args):
     return await set_controls(backend, devices, "power", on, "value")
 
 
+async def read_power_history(backend, device):
+    code = power_code(device)
+    status = await read_status(backend, device, code)
+    spec = device["capabilities"].get(code, {})
+    key = code if device["cloud"] else spec.get("dp")
+    ident = device["path"].rsplit("/", 1)[-1]
+    try:
+        history = result_json(await backend.get(
+            f"activity/devices/{ident}",
+            params={"provider": "sharing" if device["cloud"] else "local", "limit": 100},
+        ))
+    except (httpx.HTTPError, ValueError):
+        return f"{status} Command history is unavailable."
+    for event in history["events"]:
+        values = event["value"]
+        if event["kind"] == "command" and event["outcome"] == "accepted" and isinstance(values, dict):
+            power = values.get(key)
+            if type(power) is bool:
+                timestamp = datetime.fromisoformat(event["at"]).astimezone(timezone.utc)
+                return (
+                    f"{status} The latest recorded power command was "
+                    f"{'on' if power else 'off'} at {timestamp:%H:%M UTC on %d %b}."
+                )
+    return f"{status} I found no recent accepted power command in the history."
+
+
 async def execute(backend, catalog, call):
     name = call["name"]
     if name not in {tool["name"] for tool in TOOLS}:
         raise ValueError("Unknown tool")
     args = json.loads(call["arguments"])
+    if name == "explain_no_action":
+        reasons = {
+            "unclear_request": "I couldn't tell what you wanted the device to do.",
+            "device_not_found": "I couldn't find the named device or room in Smart Life.",
+            "ambiguous_target": "More than one device or room matches. Say the full name.",
+            "unsupported_control": "The device doesn't expose that control to Home Voice.",
+            "missing_value": "Say the setting you want, such as on, off, or a brightness percentage.",
+        }
+        return [f"No command sent. {reasons[args['reason']]}"]
     if name == "room_lights":
         return await room_lights(backend, catalog, args)
     ids = args["device_ids"]
@@ -390,6 +464,8 @@ async def execute(backend, catalog, call):
         raise ValueError("Unknown device")
     devices = [catalog[ident] for ident in dict.fromkeys(ids)]
     await asyncio.gather(*(hydrate_device(backend, device) for device in devices))
+    if name == "get_power_history":
+        return await asyncio.gather(*(read_power_history(backend, device) for device in devices))
     if name == "get_device_controls":
         messages = []
         for device in devices:
@@ -417,10 +493,17 @@ async def execute(backend, catalog, call):
         return await asyncio.gather(*(read_status(
             backend, device, power_code(device) if code == "power" else code,
         ) for device in devices))
+    if name == "set_light_color":
+        if args["on"] is not None and type(args["on"]) is not bool:
+            raise ValueError("Invalid power value")
+        return await set_controls(
+            backend, devices, code, args["color"], "value", color_only=True, power=args["on"],
+        )
     return await set_controls(backend, devices, code, args["value"], args["format"])
 
 
-async def set_controls(backend, devices, requested_code, requested_value, value_format):
+async def set_controls(backend, devices, requested_code, requested_value, value_format, *,
+                       color_only=False, power=None):
     writes, messages = [], []
     for device in devices:
         if device.get("read_only"):
@@ -428,7 +511,7 @@ async def set_controls(backend, devices, requested_code, requested_value, value_
             continue
         code = power_code(device) if requested_code == "power" else requested_code
         spec = device["capabilities"].get(code)
-        if not spec or not can_write(spec):
+        if not spec or not can_write(spec) or (color_only and spec["type"] != "object"):
             messages.append(f"{device['name']} has no writable {code} mapping.")
             continue
         try:
@@ -436,26 +519,60 @@ async def set_controls(backend, devices, requested_code, requested_value, value_
         except ValueError as error:
             messages.append(f"{device['name']}: {code} {error}.")
             continue
-        writes.append((device, code, spec, value))
+        values = {code: value}
+        if "cloud_hsv" in spec:
+            values = {
+                "work_mode": "colour",
+                code: {**value, **{k: round(value[k] * spec["cloud_hsv"][k] / 1000) for k in ("s", "v")}},
+            }
+        if power is not None:
+            power_control = power_code(device)
+            if not device["capabilities"].get(power_control, {}).get("writable"):
+                messages.append(f"{device['name']} has no writable power mapping.")
+                continue
+            values = {power_control: power, **values}
+        writes.append((device, code, spec, value, values))
 
-    for device, code, spec, value in writes:
+    for device, code, spec, value, values in writes:
         path = device["path"]
         if device["cloud"]:
-            url, body = f"{path}/commands", {"commands": [{"code": code, "value": value}]}
+            url = f"{path}/commands"
+            body = {"commands": [{"code": key, "value": setting} for key, setting in values.items()]}
         else:
-            url, body = f"{path}/commands/capabilities", {"values": {code: value}}
+            url, body = f"{path}/commands/capabilities", {"values": values}
         label = f"{device['name']}, {label_for(device, code)}"
         try:
             params = {"provider": "sharing"} if device["cloud"] else None
             result = result_json(await backend.post(url, json=body, params=params))
             if result.get("acknowledged") is True:
-                messages.append(f"{label}: command accepted for {display_value(value, spec)}.")
+                power_label = f"power {'on' if power else 'off'} and " if power is not None else ""
+                messages.append(f"{label}: command accepted for {power_label}{display_value(value, spec)}.")
                 continue
         except httpx.HTTPStatusError as error:
-            if error.response.status_code in (400, 403, 404, 409, 422):
-                messages.append(f"{label}: command rejected by the backend.")
-                continue
+            messages.append(f"{label}: {command_failure(error.response)}")
+            continue
+        except httpx.TimeoutException:
+            messages.append(f"{label}: timed out waiting for a reply. The device state is unknown.")
+            continue
         except (httpx.HTTPError, ValueError):
             pass
         messages.append(f"{label}: could not confirm command acceptance.")
     return messages
+
+
+def command_failure(response):
+    try:
+        detail = response.json().get("detail", "")
+    except (ValueError, AttributeError):
+        detail = ""
+    if isinstance(detail, str):
+        if "код 2001" in detail:
+            return "Tuya rejected the command because the device is offline (code 2001)."
+        code = re.search(r"Tuya rejected the cloud command \(code ([0-9]{1,12})\)", detail)
+        if code:
+            return f"Tuya rejected the command (code {code[1]})."
+        if detail.startswith("Tuya reported an error"):
+            return "The local Tuya device did not respond successfully."
+    if response.status_code in (400, 403, 404, 409, 422):
+        return f"The backend rejected the command (HTTP {response.status_code})."
+    return f"The backend could not confirm the command (HTTP {response.status_code})."
