@@ -1,0 +1,64 @@
+version: "3.8"
+
+services:
+  voice:
+    image: "${VOICE_IMAGE:?Set VOICE_IMAGE}"
+    command:
+      - uvicorn
+      - app:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8011"
+      - --ssl-certfile
+      - /run/secrets/tls_cert
+      - --ssl-keyfile
+      - /run/secrets/tls_key
+    environment:
+      VOICE_BACKEND_URL: "${VOICE_BACKEND_URL:?Set the reachable smart-home API URL}"
+      VOICE_LIGHTS: "${VOICE_LIGHTS:?Set the light ID map}"
+      OPENAI_API_KEY_FILE: /run/secrets/openai_key
+      SMART_HOME_API_TOKEN_FILE: /run/secrets/backend_token
+      VOICE_PASSWORD_FILE: /run/secrets/voice_password
+    secrets:
+      - source: home_voice_openai_key
+        target: openai_key
+      - source: home_voice_backend_token
+        target: backend_token
+      - source: home_voice_password
+        target: voice_password
+      - source: home_voice_tls_cert
+        target: tls_cert
+      - source: home_voice_tls_key
+        target: tls_key
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+    ports:
+      - target: 8011
+        published: 8011
+        protocol: tcp
+        mode: host
+    healthcheck:
+      test: ["CMD", "python", "-c", "import ssl, urllib.request; urllib.request.urlopen('https://127.0.0.1:8011/health', context=ssl._create_unverified_context(), timeout=3).close()"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.home_voice == true
+
+secrets:
+  home_voice_openai_key:
+    external: true
+  home_voice_backend_token:
+    external: true
+  home_voice_password:
+    external: true
+  home_voice_tls_cert:
+    external: true
+  home_voice_tls_key:
+    external: true

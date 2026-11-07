@@ -4,6 +4,7 @@ import json
 import os
 import secrets
 from pathlib import Path
+from typing import Annotated
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -42,7 +43,7 @@ def health():
     return {"status": "ok"}
 
 
-def authenticate(credentials: HTTPBasicCredentials = Depends(basic)):
+def authenticate(credentials: Annotated[HTTPBasicCredentials, Depends(basic)]):
     password = secret("VOICE_PASSWORD")
     if not password:
         raise HTTPException(503, "Set VOICE_PASSWORD on the server.")

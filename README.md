@@ -39,3 +39,48 @@ example, keep the process on loopback and place your LAN HTTPS reverse proxy
 in front of it. Open the proxy's HTTPS address on each device. The site and
 backend can stay on the LAN. Audio, the transcript, and configured light
 labels are sent to OpenAI, so voice commands require internet access.
+
+## Deploy to Docker Swarm
+
+Run these steps on the Swarm manager. Label the node that should host the LAN
+endpoint. Its address must match the TLS certificate, and its firewall should
+allow TCP 8011 from your home network.
+
+```sh
+docker node update --label-add home_voice=true YOUR_NODE
+```
+
+Create the five Swarm secrets from protected files outside this repository.
+Use the backend API token already configured in smart-home-service. If the
+backend uses no token, supply an empty line as the token file. The certificate
+file should contain the certificate chain trusted by your phone and laptop.
+
+```sh
+docker secret create home_voice_openai_key /path/to/openai-key
+docker secret create home_voice_backend_token /path/to/backend-token
+docker secret create home_voice_password /path/to/voice-password
+docker secret create home_voice_tls_cert /path/to/fullchain.pem
+docker secret create home_voice_tls_key /path/to/privkey.pem
+```
+
+For a single-node Swarm, build the image on that node. Use a new tag for each
+update. Set the backend URL to an address reachable from the voice container,
+such as the existing smart-home-service Docker frontend's LAN address on
+port 8080. A container's loopback address only reaches that container.
+
+```sh
+export VOICE_IMAGE=smart-home-voice:v1
+export VOICE_BACKEND_URL=http://192.168.1.20:8080
+export VOICE_LIGHTS='{"12":"living room ceiling light"}'
+docker build -t "$VOICE_IMAGE" .
+docker stack config -c swarm.yaml
+docker stack deploy --resolve-image never -c swarm.yaml home-voice
+docker stack services home-voice
+```
+
+For a multi-node Swarm, build for the target node's architecture and push the
+tag to a registry that node can reach. Deploy with the registry-qualified
+`VOICE_IMAGE` and use `--with-registry-auth` if the registry is private.
+
+Open `https://YOUR_VOICE_HOST:8011`, sign in with username `voice`, and grant
+microphone access. Check a configured light with an on or off command.
