@@ -5,6 +5,7 @@ import json
 import math
 import re
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from urllib.parse import quote
 
@@ -16,6 +17,13 @@ AUTO_CONTROL_CATEGORIES = {"dj", "dd", "kg", "cz"}
 AUTO_REFRESH_INTERVAL = 300
 _last_refresh = float("-inf")
 _last_topology_sync = float("-inf")
+
+
+@dataclass(frozen=True)
+class Answer:
+    title: str
+    detail: str
+    status: str = "info"
 
 
 def tool(name, description, properties):
@@ -279,7 +287,12 @@ def model_catalog(catalog):
 
 
 def label_for(device, code):
-    return device["channels"].get(code) or code.replace("_", " ")
+    labels = {
+        "switch": "Power", "switch_led": "Power", "bright_value_v2": "Brightness",
+        "temp_value_v2": "Color temperature", "colour_data_v2": "Color",
+        "colour_data": "Color", "work_mode": "Mode",
+    }
+    return device["channels"].get(code) or labels.get(code, code.replace("_", " "))
 
 
 def display_value(value, spec):
@@ -348,9 +361,9 @@ def checked_value(spec, value, value_format):
 async def read_status(backend, device, code):
     name, path, specs = device["name"], device["path"], device["capabilities"]
     if code is not None and (code not in specs or not specs[code]["readable"]):
-        return f"{name} has no readable {code} mapping."
+        return Answer(name, f"No readable {code} mapping.", "unavailable")
     if not specs:
-        return f"{name} has no status mapping for its configured connection."
+        return Answer(name, "No status mapping for this connection.", "unavailable")
     try:
         if device["cloud"]:
             response = result_json(await backend.get(
@@ -360,7 +373,7 @@ async def read_status(backend, device, code):
             response = result_json(await backend.get(f"{path}/state", params={"refresh": "true"}))
         if device["cloud"]:
             if not response["online"]:
-                return f"{name} is offline in Tuya Sharing."
+                return Answer(name, "Tuya Sharing reports the device offline.", "offline")
             readings = response["status"]
         else:
             readings = {
@@ -368,13 +381,15 @@ async def read_status(backend, device, code):
                 if reading["known"] and not reading["stale"]
             }
     except (httpx.HTTPError, ValueError, KeyError):
-        return f"Could not refresh {name}."
+        return Answer(name, "Could not refresh the device state.", "unavailable")
     values = [
         f"{label_for(device, key)}: {display_value(value, specs[key])}"
         for key, value in readings.items()
         if key in specs and specs[key]["readable"] and (code is None or key == code)
     ]
-    return f"{name}: {', '.join(values)}." if values else f"No current reading for {name}."
+    if values:
+        return Answer(name, f"{', '.join(values)}.", "state")
+    return Answer(name, "No current reading is available.", "unavailable")
 
 
 async def hydrate_device(backend, device):
@@ -404,10 +419,10 @@ async def room_lights(backend, catalog, args, selected):
         and (home is None or device["home"].casefold() == home.strip().casefold())
     ]
     if len({device["room_key"] for device in candidates}) > 1:
-        return [f"More than one Smart Life room is named {room}. Include the home name."]
+        return [Answer(room, "More than one room matches. Include the home name.", "clarify")]
     devices = [device for device in candidates if device["room_light"]]
     if not devices:
-        return [f"No lights found in the Smart Life room {room}."]
+        return [Answer(room, "No lights found in this Smart Life room.", "unavailable")]
     selected.extend((device["path"], None) for device in devices)
     await asyncio.gather(*(hydrate_device(backend, device) for device in devices))
     if on is None:
@@ -417,7 +432,7 @@ async def room_lights(backend, catalog, args, selected):
 
 async def read_power_history(backend, device):
     code = power_code(device)
-    status = await read_status(backend, device, code)
+    state = await read_status(backend, device, code)
     spec = device["capabilities"].get(code, {})
     key = code if device["cloud"] else spec.get("dp")
     ident = device["path"].rsplit("/", 1)[-1]
@@ -427,18 +442,18 @@ async def read_power_history(backend, device):
             params={"provider": "sharing" if device["cloud"] else "local", "limit": 100},
         ))
     except (httpx.HTTPError, ValueError):
-        return f"{status} Command history is unavailable."
+        return Answer(state.title, f"{state.detail} Command history is unavailable.", state.status)
     for event in history["events"]:
         values = event["value"]
         if event["kind"] == "command" and event["outcome"] == "accepted" and isinstance(values, dict):
             power = values.get(key)
             if type(power) is bool:
                 timestamp = datetime.fromisoformat(event["at"]).astimezone(timezone.utc)
-                return (
-                    f"{status} The latest recorded power command was "
-                    f"{'on' if power else 'off'} at {timestamp:%H:%M UTC on %d %b}."
+                return Answer(
+                    state.title, f"{state.detail} The latest recorded power command was "
+                    f"{'on' if power else 'off'} at {timestamp:%H:%M UTC on %d %b}.", state.status,
                 )
-    return f"{status} I found no recent accepted power command in the history."
+    return Answer(state.title, f"{state.detail} No recent accepted power command in the history.", state.status)
 
 
 async def execute(backend, catalog, call, *, selected=None):
@@ -456,7 +471,7 @@ async def execute(backend, catalog, call, *, selected=None):
             "unsupported_control": "The device doesn't expose that control to Home Voice.",
             "missing_value": "Say the setting you want, such as on, off, or a brightness percentage.",
         }
-        return [f"No command sent. {reasons[args['reason']]}"]
+        return [Answer("Home Voice", f"No command sent. {reasons[args['reason']]}", "clarify")]
     if name == "room_lights":
         return await room_lights(backend, catalog, args, selected)
     ids = args["device_ids"]
@@ -484,7 +499,7 @@ async def execute(backend, catalog, call, *, selected=None):
                 for code, spec in device["capabilities"].items()
                 if not device.get("read_only") and can_write(spec)
             )
-            messages.append(f"{device['name']}: {controls or 'no writable controls are mapped'}.")
+            messages.append(Answer(device["name"], f"{controls or 'No writable controls are mapped'}."))
         return messages
     if name == "get_aliases":
         messages = []
@@ -493,7 +508,7 @@ async def execute(backend, catalog, call, *, selected=None):
             channels = ", ".join(
                 f"{code.replace('_', ' ')}: {label}" for code, label in device["channels"].items()
             ) or ("none saved" if device["cloud_metadata"] else "metadata unavailable")
-            messages.append(f"{device['name']}. Device names and aliases: {aliases}. Channel aliases: {channels}.")
+            messages.append(Answer(device["name"], f"Device names and aliases: {aliases}. Channel aliases: {channels}."))
         return messages
 
     code = args["capability"]
@@ -517,17 +532,17 @@ async def set_controls(backend, devices, requested_code, requested_value, value_
     writes, messages = [], []
     for device in devices:
         if device.get("read_only"):
-            messages.append(f"{device['name']} is available for voice status only.")
+            messages.append(Answer(device["name"], "This device is available for status only.", "unavailable"))
             continue
         code = power_code(device) if requested_code == "power" else requested_code
         spec = device["capabilities"].get(code)
         if not spec or not can_write(spec) or (color_only and spec["type"] != "object"):
-            messages.append(f"{device['name']} has no writable {code} mapping.")
+            messages.append(Answer(device["name"], f"No writable {code} mapping.", "unavailable"))
             continue
         try:
             value = checked_value(spec, requested_value, value_format)
         except ValueError as error:
-            messages.append(f"{device['name']}: {code} {error}.")
+            messages.append(Answer(device["name"], f"{code} {error}.", "clarify"))
             continue
         values = {code: value}
         if "cloud_hsv" in spec:
@@ -538,7 +553,7 @@ async def set_controls(backend, devices, requested_code, requested_value, value_
         if power is not None:
             power_control = power_code(device)
             if not device["capabilities"].get(power_control, {}).get("writable"):
-                messages.append(f"{device['name']} has no writable power mapping.")
+                messages.append(Answer(device["name"], "No writable power mapping.", "unavailable"))
                 continue
             values = {power_control: power, **values}
         writes.append((device, code, spec, value, values))
@@ -556,33 +571,33 @@ async def set_controls(backend, devices, requested_code, requested_value, value_
             result = result_json(await backend.post(url, json=body, params=params))
             if result.get("acknowledged") is True:
                 power_label = f"power {'on' if power else 'off'} and " if power is not None else ""
-                messages.append(f"{label}: command accepted for {power_label}{display_value(value, spec)}.")
+                messages.append(Answer(label, f"Command accepted for {power_label}{display_value(value, spec)}.", "accepted"))
                 continue
         except httpx.HTTPStatusError as error:
-            messages.append(f"{label}: {command_failure(error.response)}")
+            messages.append(command_failure(label, error.response))
             continue
         except httpx.TimeoutException:
-            messages.append(f"{label}: timed out waiting for a reply. The device state is unknown.")
+            messages.append(Answer(label, "Timed out waiting for a reply. The device state is unknown.", "unconfirmed"))
             continue
         except (httpx.HTTPError, ValueError):
             pass
-        messages.append(f"{label}: could not confirm command acceptance.")
+        messages.append(Answer(label, "Could not confirm command acceptance.", "unconfirmed"))
     return messages
 
 
-def command_failure(response):
+def command_failure(label, response):
     try:
         detail = response.json().get("detail", "")
     except (ValueError, AttributeError):
         detail = ""
     if isinstance(detail, str):
         if "код 2001" in detail:
-            return "Tuya rejected the command because the device is offline (code 2001)."
+            return Answer(label, "Tuya rejected the command because the device is offline (code 2001).", "offline")
         code = re.search(r"Tuya rejected the cloud command \(code ([0-9]{1,12})\)", detail)
         if code:
-            return f"Tuya rejected the command (code {code[1]})."
+            return Answer(label, f"Tuya rejected the command (code {code[1]}).", "rejected")
         if detail.startswith("Tuya reported an error"):
-            return "The local Tuya device did not respond successfully."
+            return Answer(label, "The local Tuya device did not respond successfully.", "unconfirmed")
     if response.status_code in (400, 403, 404, 409, 422):
-        return f"The backend rejected the command (HTTP {response.status_code})."
-    return f"The backend could not confirm the command (HTTP {response.status_code})."
+        return Answer(label, f"The backend rejected the command (HTTP {response.status_code}).", "rejected")
+    return Answer(label, f"The backend could not confirm the command (HTTP {response.status_code}).", "unconfirmed")

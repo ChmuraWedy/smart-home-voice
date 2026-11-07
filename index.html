@@ -6,27 +6,75 @@
   <title>Home Voice</title>
   <style>
     :root { color-scheme: dark; font: 16px system-ui, sans-serif; }
-    body { margin: 0; background: #111214; color: #f5f5f5; }
-    main { min-height: 100svh; display: grid; place-content: center; text-align: center; padding: 0 24px; }
-    h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 32px; }
-    button {
-      display: grid; place-items: center; margin: auto; width: 120px; height: 120px;
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #111214; color: #eef2f8; }
+    main {
+      display: grid; grid-template-rows: auto minmax(0, 1fr) auto;
+      height: 100vh; height: 100dvh; max-width: 720px; margin: auto;
+      background: #15171c;
+    }
+    header { padding: 16px 20px; background: #191d25; border-bottom: 1px solid #343c4a; }
+    h1 { font-size: 1.2rem; font-weight: 650; margin: 0; }
+    header p { margin: 3px 0 0; font-size: .82rem; color: #a8b1c0; }
+    #conversation { overflow-y: auto; padding: 18px 20px; }
+    #empty { margin: 0; color: #a8b1c0; line-height: 1.5; }
+    .turn { display: grid; gap: 8px; margin-bottom: 18px; }
+    .utterance {
+      justify-self: end; max-width: 90%; padding: 10px 13px; margin: 0;
+      background: #242935; border-radius: 15px 15px 5px 15px;
+      line-height: 1.45; overflow-wrap: anywhere; white-space: pre-wrap;
+    }
+    #transcript { margin-left: auto; width: fit-content; color: #ced7e7; }
+    .answer {
+      background: #1e222a; border: 1px solid #3a4352; border-radius: 14px;
+      padding: 12px 14px; overflow-wrap: anywhere;
+    }
+    .answer-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 6px 12px; flex-wrap: wrap; }
+    .answer h2 { font-size: .95rem; margin: 0; }
+    .answer p { margin: 6px 0 0; line-height: 1.45; color: #dee5ef; }
+    .answer small { display: block; margin-top: 6px; color: #a8b1c0; }
+    .answer-badge { font-size: .76rem; color: #b4c8e5; }
+    .answer[data-status="offline"] .answer-badge,
+    .answer[data-status="rejected"] .answer-badge,
+    .answer[data-status="unconfirmed"] .answer-badge { color: #ffc7b0; }
+    footer {
+      display: grid; justify-items: center; gap: 10px;
+      padding: 12px 20px max(10px, env(safe-area-inset-bottom));
+      background: #191d25; border-top: 1px solid #343c4a; text-align: center;
+    }
+    #voice {
+      display: grid; place-items: center; width: 120px; height: 120px;
       border-radius: 50%; border: 1px solid #e6efff; color: #101927; cursor: pointer;
       background: radial-gradient(circle at 36% 22%, #fff 8%, #dcf4ff 36%, #9bb9f2 72%, #a9a2ed);
       box-shadow: 0 0 54px #8bacf654; touch-action: manipulation;
     }
-    button:focus-visible { outline: 3px solid white; outline-offset: 7px; }
+    :is(button, summary, input):focus-visible { outline: 2px solid #b9d1ff; outline-offset: 3px; }
     button:disabled { opacity: .65; cursor: wait; }
-    button[aria-pressed="true"] { background: #ffc7c5; box-shadow: 0 0 54px #ff928975; }
-    button[aria-pressed="true"] svg:first-child, button[aria-pressed="false"] svg:last-child { display: none; }
-    p { margin: 18px auto 0; max-width: 32rem; overflow-wrap: anywhere; }
-    #transcript { margin-top: 8px; color: #b1b4bc; }
+    #voice[aria-pressed="true"] { background: #ffc7c5; box-shadow: 0 0 54px #ff928975; }
+    #voice[aria-pressed="true"] svg:first-child, #voice[aria-pressed="false"] svg:last-child { display: none; }
+    #status { margin: 0; font-size: .9rem; font-weight: 600; }
+    details { width: min(100%, 410px); }
+    summary { width: fit-content; min-height: 44px; padding: 10px 6px; margin: auto; cursor: pointer; color: #b1b8c7; font-size: .85rem; }
+    form { display: flex; gap: 8px; padding-bottom: 4px; }
+    form :is(input,button) { background: #242935; color: inherit; border: 1px solid #3a4352; border-radius: 10px; min-height: 44px; font: inherit; }
+    form input { flex: 1; min-width: 0; padding: 8px 12px; }
+    form button { flex: 0 0 44px; font-size: 1.15rem; cursor: pointer; }
+    @media (max-width: 480px), (max-height: 640px) {
+      #voice { width: 96px; height: 96px; }
+      #conversation { padding: 14px; }
+    }
   </style>
 </head>
 <body>
 <main>
-  <h1>Home Voice</h1>
-  <button id="voice" aria-label="Voice recording" aria-pressed="false">
+  <header><h1>Home Voice</h1><p>Conversation</p></header>
+  <section id="conversation" aria-label="Conversation">
+    <p id="empty">Ask about your home or give a command.</p>
+    <div id="messages" role="log" aria-label="Messages" aria-relevant="additions"></div>
+    <p id="transcript" class="utterance" aria-live="off" hidden></p>
+  </section>
+  <footer>
+  <button id="voice" type="button" aria-label="Tap to speak" aria-pressed="false">
     <svg aria-hidden="true" width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
       <rect x="9" y="2" width="6" height="13" rx="3"/>
       <path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3m-3 0h6"/>
@@ -36,12 +84,31 @@
     </svg>
   </button>
   <p id="status" role="status">Tap to speak</p>
-  <p id="transcript"></p>
+  <details>
+    <summary>Type instead</summary>
+    <form id="typed-command">
+      <input id="typed-message" aria-label="Message Home Voice" placeholder="Message Home Voice"
+             type="text" maxlength="1000" autocomplete="off" enterkeyhint="send" required>
+      <button id="send" type="submit" aria-label="Send typed message">↑</button>
+    </form>
+  </details>
+  </footer>
 </main>
 <script>
   const button = document.querySelector('#voice');
   const status = document.querySelector('#status');
   const transcript = document.querySelector('#transcript');
+  const conversation = document.querySelector('#conversation');
+  const messages = document.querySelector('#messages');
+  const empty = document.querySelector('#empty');
+  const typedForm = document.querySelector('#typed-command');
+  const typedMessage = document.querySelector('#typed-message');
+  const send = document.querySelector('#send');
+  const badgeLabels = new Map([
+    ['state', 'State reported'], ['accepted', 'Command accepted'],
+    ['offline', 'Offline'], ['unavailable', 'Unavailable'],
+    ['unconfirmed', 'Not confirmed'], ['rejected', 'Rejected'], ['clarify', 'Needs clarification'],
+  ]);
   const voiceSession = globalThis.crypto?.randomUUID?.();
   const headers = {
     'X-Voice-Command': '1',
@@ -50,10 +117,65 @@
   let stopRecording;
   let limit;
 
+  function scrollToLatest() {
+    conversation.scrollTop = conversation.scrollHeight;
+  }
+
+  function showTranscript(text) {
+    transcript.textContent = text;
+    transcript.hidden = !text;
+    if (text) empty.hidden = true;
+    scrollToLatest();
+  }
+
+  function addTurn(text, cards) {
+    const turn = document.createElement('div');
+    turn.className = 'turn';
+    if (text) {
+      const bubble = document.createElement('p');
+      bubble.className = 'utterance';
+      bubble.dir = 'auto';
+      bubble.textContent = text;
+      turn.append(bubble);
+    }
+    for (const card of cards) {
+      const answer = document.createElement('article');
+      answer.className = 'answer';
+      answer.dataset.status = card.status;
+      const heading = document.createElement('div');
+      heading.className = 'answer-heading';
+      const title = document.createElement('h2');
+      title.textContent = card.title;
+      heading.append(title);
+      const label = badgeLabels.get(card.status);
+      if (label) {
+        const badge = document.createElement('span');
+        badge.className = 'answer-badge';
+        badge.textContent = label;
+        heading.append(badge);
+      }
+      const detail = document.createElement('p');
+      detail.dir = 'auto';
+      detail.textContent = card.detail;
+      answer.append(heading, detail);
+      if (card.status === 'accepted') {
+        const note = document.createElement('small');
+        note.textContent = 'Device state has not been verified.';
+        answer.append(note);
+      }
+      turn.append(answer);
+    }
+    empty.hidden = true;
+    messages.append(turn);
+    if (messages.children.length > 30) messages.firstElementChild.remove();
+    showTranscript('');
+  }
+
   function recording(stop, message) {
     stopRecording = stop;
     limit = setTimeout(stop, 15000);
     button.setAttribute('aria-pressed', 'true');
+    button.setAttribute('aria-label', 'Stop recording');
     button.disabled = false;
     status.textContent = message;
   }
@@ -62,24 +184,56 @@
     clearTimeout(limit);
     stopRecording = undefined;
     button.setAttribute('aria-pressed', 'false');
+    button.setAttribute('aria-label', 'Tap to speak');
     button.disabled = true;
+    typedMessage.disabled = send.disabled = true;
     status.textContent = message;
   }
 
   function finished(message) {
     processing(message);
     button.disabled = false;
+    typedMessage.disabled = send.disabled = false;
   }
 
-  function showResult(result) {
-    transcript.textContent = result.transcript;
-    finished(result.message);
-    if (window.speechSynthesis && window.SpeechSynthesisUtterance) {
+  function showFailure(message, outcome = 'unconfirmed') {
+    addTurn(transcript.textContent, [{title: 'Home Voice', detail: message, status: outcome}]);
+    finished('Tap to speak');
+  }
+
+  function showResult(result, speak = true) {
+    addTurn(result.transcript, result.cards?.length ? result.cards : [
+      {title: 'Home Voice', detail: result.message, status: 'info'},
+    ]);
+    finished('Tap to speak');
+    if (speak && window.speechSynthesis && window.SpeechSynthesisUtterance) {
       const reply = new SpeechSynthesisUtterance(result.message);
       reply.lang = 'en';
       window.speechSynthesis.speak(reply);
     }
   }
+
+  typedForm.addEventListener('submit', async event => {
+    event.preventDefault();
+    const text = typedMessage.value.trim();
+    if (!text || send.disabled) return;
+    window.speechSynthesis?.cancel();
+    typedMessage.value = '';
+    showTranscript(text);
+    processing('Running command…');
+    try {
+      const response = await fetch('/command', {
+        method: 'POST', headers: {...headers, 'Content-Type': 'application/json'},
+        body: JSON.stringify({text}),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail || 'Command failed.');
+      showResult(result, false);
+    } catch (error) {
+      showFailure(error.message || 'Command failed. Try again.');
+    }
+    if (typedForm.closest('details').open) typedMessage.focus();
+  });
 
   function release(stream, context) {
     stream?.getTracks().forEach(track => track.stop());
@@ -129,15 +283,15 @@
       release(stream, context);
       socket.close();
       if (result) showResult(result);
-      else finished(message);
+      else showFailure(message);
     }
 
     socket.onerror = socket.onclose = () => complete('Live connection lost. Tap to try again.');
     socket.onmessage = ({ data }) => {
       const event = JSON.parse(data);
-      if (event.type === 'delta') transcript.textContent += event.text;
+      if (event.type === 'delta') showTranscript(transcript.textContent + event.text);
       if (event.type === 'transcript') {
-        transcript.textContent = event.text;
+        showTranscript(event.text);
         status.textContent = 'Running command…';
       }
       if (event.type === 'result') complete(null, event);
@@ -187,7 +341,7 @@
         if (!response.ok) throw new Error(result.detail || 'Command failed.');
         showResult(result);
       } catch (error) {
-        finished(error.message || 'Command failed. Tap to try again.');
+        showFailure(error.message || 'Command failed. Tap to try again.');
       }
     };
     recorder.start();
@@ -203,9 +357,9 @@
       return;
     }
     window.speechSynthesis?.cancel();
-    transcript.textContent = '';
+    showTranscript('');
     if (!navigator.mediaDevices?.getUserMedia) {
-      finished('Open this page over trusted HTTPS to use the microphone.');
+      showFailure('Open this page over trusted HTTPS to use the microphone.', 'unavailable');
       return;
     }
 
@@ -234,7 +388,7 @@
       fileRecording(stream);
     } catch {
       release(stream, context);
-      finished('Microphone unavailable. Check browser permissions and try again.');
+      showFailure('Microphone unavailable. Check browser permissions and try again.', 'unavailable');
     }
   });
 </script>

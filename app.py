@@ -7,6 +7,7 @@ import os
 import re
 import secrets
 import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Annotated
 
@@ -23,7 +24,7 @@ from fastapi.responses import FileResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from websockets.exceptions import WebSocketException
 
-from controls import TOOLS, execute, load_catalog, model_catalog, result_json
+from controls import TOOLS, Answer, execute, load_catalog, model_catalog, result_json
 from live import StreamError, stream_transcript
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
@@ -212,25 +213,45 @@ async def command(request: Request):
     if not key:
         raise HTTPException(503, "Set OPENAI_API_KEY on the server.")
     media_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
-    if media_type not in FORMATS:
-        raise HTTPException(415, "This recording format is unsupported.")
-    audio = bytearray()
+    typed = media_type == "application/json"
+    if not typed and media_type not in FORMATS:
+        raise HTTPException(415, "This command format is unsupported.")
+    max_size = 16 * 1024 if typed else 2 * 1024 * 1024
+    body = bytearray()
     async for chunk in request.stream():
-        if len(audio) + len(chunk) > 2 * 1024 * 1024:
-            raise HTTPException(413, "Recording is too large.")
-        audio.extend(chunk)
-    if not audio:
-        raise HTTPException(400, "No audio was recorded.")
-    try:
-        transcript = await transcribe(bytes(audio), media_type, key)
-    except (httpx.HTTPError, ValueError, TypeError, KeyError, AttributeError):
-        raise HTTPException(502, "Could not transcribe the recording.") from None
+        if len(body) + len(chunk) > max_size:
+            raise HTTPException(413, "Command is too large.")
+        body.extend(chunk)
+    if typed:
+        try:
+            transcript = json.loads(body)["text"].strip()
+        except (ValueError, TypeError, KeyError, AttributeError):
+            raise HTTPException(400, "Enter a text command.") from None
+        if not 0 < len(transcript) <= 1000:
+            raise HTTPException(400, "Enter a message between 1 and 1000 characters.")
+    else:
+        if not body:
+            raise HTTPException(400, "No audio was recorded.")
+        try:
+            transcript = await transcribe(bytes(body), media_type, key)
+        except (httpx.HTTPError, ValueError, TypeError, KeyError, AttributeError):
+            raise HTTPException(502, "Could not transcribe the recording.") from None
     return await run_command(transcript, key, session_id)
+
+
+def chat_result(transcript, cards, *, status_only=False):
+    spoken = [
+        f"{card.title}: {card.detail}" if card.title != "Home Voice" else card.detail
+        for card in cards
+    ]
+    if status_only:
+        spoken.insert(0, "Status check only. No device command was sent.")
+    return {"transcript": transcript, "message": " ".join(spoken), "cards": [asdict(card) for card in cards]}
 
 
 async def run_command(transcript, key, session_id):
     if not transcript:
-        return {"transcript": "", "message": "No speech detected. Try again."}
+        return chat_result("", [Answer("Home Voice", "No speech detected. Try again.", "clarify")])
     try:
         labels = json.loads(os.getenv("VOICE_DEVICES") or os.getenv("VOICE_LIGHTS") or "{}")
         auto_tuya = os.getenv("VOICE_AUTO_TUYA") == "1"
@@ -262,19 +283,19 @@ async def run_command(transcript, key, session_id):
         except (httpx.HTTPError, ValueError, TypeError, KeyError, AttributeError):
             raise HTTPException(502, "Could not load the device catalog or interpret the recording.") from None
         if not catalog:
-            return {"transcript": transcript, "message": "No voice devices are available in the current inventory."}
+            return chat_result(transcript, [Answer("Home Voice", "No voice devices are available.", "unavailable")])
         if not calls:
-            message = ("Name a configured device or channel and ask for aliases, status, or a change."
-                       if transcript else "No speech detected. Try again.")
-            return {"transcript": transcript, "message": message}
+            return chat_result(transcript, [Answer(
+                "Home Voice", "Name a device or channel and ask for status, aliases, or a change.", "clarify",
+            )])
         if len(calls) > 8:
-            return {"transcript": transcript, "message": "Ask for fewer changes at a time."}
+            return chat_result(transcript, [Answer("Home Voice", "Ask for fewer changes at a time.", "clarify")])
 
         call_names = [call["name"] for call in calls]
         logger.info("Voice request selected tools: %s", ", ".join(call_names))
         if "explain_no_action" in call_names:
             calls = [call for call in calls if call["name"] == "explain_no_action"][:1]
-        messages = []
+        cards = []
         selected = []
         status_only = True
         for call in calls:
@@ -283,11 +304,9 @@ async def run_command(transcript, key, session_id):
                     call["name"] in ("get_device_status", "get_power_history")
                     or (call["name"] == "room_lights" and json.loads(call["arguments"])["on"] is None)
                 )
-                messages.extend(await execute(backend, catalog, call, selected=selected))
+                cards.extend(await execute(backend, catalog, call, selected=selected))
             except (ValueError, TypeError, KeyError):
                 status_only = False
-                messages.append("Could not match one request to a configured device or control.")
+                cards.append(Answer("Home Voice", "Could not match a request to a device or control.", "clarify"))
         remember_targets(session_id, selected)
-    if status_only:
-        messages.insert(0, "Status check only. No device command was sent.")
-    return {"transcript": transcript, "message": " ".join(messages)}
+    return chat_result(transcript, cards, status_only=status_only)
