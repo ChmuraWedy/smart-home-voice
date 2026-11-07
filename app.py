@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import secrets
 from pathlib import Path
 from typing import Annotated
@@ -65,6 +66,7 @@ async def interpret(audio, media_type, key, catalog):
                 "codes or vendor encodings. Match all named rooms and devices. For a channel alias, "
                 "select its specific switch_N code. Use switch or switch_led for device power, "
                 "and brightness or an advertised bright_value code for light level. "
+                "Room light groups include only lights. Select an extractor only when requested. "
                 "Use get_aliases for device or channel names, get_device_controls for supported "
                 "commands, and get_device_status for readings. "
                 "Only write for an explicit request. Do not change every channel when one is ambiguous. "
@@ -89,18 +91,22 @@ async def command(request: Request):
         raise HTTPException(403, "Open the voice page to send a command.")
     key = secret("OPENAI_API_KEY")
     try:
-        labels = json.loads(os.getenv("VOICE_DEVICES") or os.getenv("VOICE_LIGHTS", "{}"))
+        labels = json.loads(os.getenv("VOICE_DEVICES") or os.getenv("VOICE_LIGHTS") or "{}")
+        cloud_labels = json.loads(os.getenv("VOICE_CLOUD_DEVICES") or "{}")
         cloud_ids = {part.strip() for part in os.getenv("VOICE_CLOUD_IDS", "").split(",") if part.strip()}
-        if not isinstance(labels, dict) or not labels or not all(
-            ident.isascii() and ident.isdecimal() and int(ident) > 0
-            and isinstance(label, str) and label.strip()
-            for ident, label in labels.items()
-        ):
+        if not isinstance(labels, dict) or not isinstance(cloud_labels, dict):
+            raise TypeError
+        if not (labels or cloud_labels) or not cloud_ids <= labels.keys():
             raise ValueError
-        if not cloud_ids <= labels.keys():
+        if any(not isinstance(label, str) or not label.strip()
+               for label in (*labels.values(), *cloud_labels.values())):
             raise ValueError
-    except ValueError:
-        raise HTTPException(503, "Configure VOICE_DEVICES and any VOICE_CLOUD_IDS on the server.") from None
+        if any(not ident.isascii() or not ident.isdecimal() or int(ident) <= 0 for ident in labels):
+            raise ValueError
+        if any(not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", ident) for ident in cloud_labels):
+            raise ValueError
+    except (ValueError, TypeError):
+        raise HTTPException(503, "Check the server's voice device configuration.") from None
     if not key:
         raise HTTPException(503, "Set OPENAI_API_KEY on the server.")
 
@@ -123,7 +129,7 @@ async def command(request: Request):
         timeout=15,
     ) as backend:
         try:
-            catalog = await load_catalog(backend, labels, cloud_ids)
+            catalog = await load_catalog(backend, labels, cloud_ids, cloud_labels)
             transcript, calls = await interpret(bytes(audio), media_type, key, catalog)
         except (httpx.HTTPError, ValueError, TypeError, KeyError, AttributeError):
             raise HTTPException(502, "Could not load the device catalog or interpret the recording.") from None

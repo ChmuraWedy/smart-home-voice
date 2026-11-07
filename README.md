@@ -27,6 +27,7 @@ starting the voice app.
 | `VOICE_PASSWORD` | A unique password for the voice page |
 | `VOICE_DEVICES` | JSON object mapping allowed numeric inventory IDs to voice names, e.g. `{"12":"kitchen light","14":"workroom switch"}`. Falls back to the legacy `VOICE_LIGHTS` setting. |
 | `VOICE_CLOUD_IDS` | Optional comma-separated subset of those IDs to route through the connected Tuya Sharing account. Other devices use the local API. |
+| `VOICE_CLOUD_DEVICES` | Optional JSON map of Tuya Sharing device IDs to voice names for devices outside the local inventory. Only devices in the connected Sharing account can be selected. |
 | `VOICE_BACKEND_URL` | Backend base URL, defaults to `http://127.0.0.1:8000` |
 | `SMART_HOME_API_TOKEN` | Backend API token, if configured |
 | `VOICE_MODEL` | Optional function-calling model override |

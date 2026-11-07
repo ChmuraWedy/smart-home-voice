@@ -79,8 +79,39 @@ def cloud_controls(cloud):
     return result
 
 
-async def load_catalog(backend, labels, cloud_ids):
-    rows = result_json(await backend.get("devices"))
+def catalog_entry(name, row, remote, path, use_cloud):
+    definitions = remote["controls"]["definitions"] if remote else {}
+    channels = {
+        spec["code"]: spec["user_label"]
+        for spec in definitions.get("functions", []) + definitions.get("status_range", [])
+        if CHANNEL.fullmatch(spec["code"]) and spec.get("user_label")
+    }
+    return {
+        "name": name,
+        "aliases": sorted(set(row["aliases"]) | {row["name"]}
+                          | set(remote.get("aliases", []) if remote else [])),
+        "channels": channels,
+        "capabilities": cloud_controls(remote) if use_cloud and remote else row.get("capabilities", {}),
+        "path": path,
+        "cloud": use_cloud, "cloud_metadata": remote is not None,
+    }
+
+
+async def refresh_cloud_definitions(backend, remote):
+    if remote["controls"].get("ready"):
+        return
+    try:
+        remote["controls"]["definitions"] = result_json(await backend.get(
+            f"cloud/devices/{quote(remote['id'], safe='')}/functions",
+            params={"provider": "sharing"},
+        ))
+    except (httpx.HTTPError, ValueError):
+        pass
+
+
+async def load_catalog(backend, labels, cloud_ids, cloud_labels=None):
+    cloud_labels = cloud_labels or {}
+    rows = result_json(await backend.get("devices")) if labels else []
     try:
         cloud = {row["id"]: row for row in result_json(await backend.get(
             "cloud/devices", params={"provider": "sharing"}, timeout=4,
@@ -88,29 +119,28 @@ async def load_catalog(backend, labels, cloud_ids):
     except (httpx.HTTPError, ValueError):
         cloud = {}
 
+    configured = {row["device_id"]: row for row in rows if str(row["id"]) in labels}
+    cloud_targets = set(cloud_labels) | {
+        device_id for device_id, row in configured.items() if str(row["id"]) in cloud_ids
+    }
+    await asyncio.gather(*(refresh_cloud_definitions(backend, cloud[ident])
+                           for ident in cloud_targets if ident in cloud))
     catalog = {}
     for row in rows:
         ident = str(row["id"])
         if ident not in labels or not row["enabled"]:
             continue
         remote = cloud.get(row["device_id"])
-        definitions = remote["controls"]["definitions"] if remote else {}
-        channels = {
-            spec["code"]: spec["user_label"]
-            for spec in definitions.get("functions", []) + definitions.get("status_range", [])
-            if CHANNEL.fullmatch(spec["code"]) and spec.get("user_label")
-        }
         use_cloud = ident in cloud_ids
-        capabilities = cloud_controls(remote) if use_cloud and remote else (
-            {} if use_cloud else row["capabilities"]
-        )
-        catalog[ident] = {
-            "name": labels[ident], "aliases": sorted(set(row["aliases"]) | {row["name"]}
-                                                  | set(remote.get("aliases", []) if remote else [])),
-            "channels": channels, "capabilities": capabilities,
-            "path": f"cloud/devices/{quote(row['device_id'], safe='')}" if use_cloud else f"devices/{ident}",
-            "cloud": use_cloud, "cloud_metadata": remote is not None,
-        }
+        if use_cloud and not remote:
+            row = {**row, "capabilities": {}}
+        path = f"cloud/devices/{quote(row['device_id'], safe='')}" if use_cloud else f"devices/{ident}"
+        catalog[ident] = catalog_entry(labels[ident], row, remote, path, use_cloud)
+    for index, (device_id, name) in enumerate(cloud_labels.items(), start=1):
+        remote = cloud.get(device_id)
+        if remote and device_id not in configured:
+            path = f"cloud/devices/{quote(device_id, safe='')}"
+            catalog[f"cloud-{index}"] = catalog_entry(name, remote, remote, path, True)
     return catalog
 
 
