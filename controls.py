@@ -392,7 +392,7 @@ def power_code(device):
                 power[0] if len(power) == 1 else "power")
 
 
-async def room_lights(backend, catalog, args):
+async def room_lights(backend, catalog, args, selected):
     room, home, on = args["room"], args["home"], args["on"]
     if not isinstance(room, str) or (home is not None and not isinstance(home, str)):
         raise ValueError("Invalid room")
@@ -408,6 +408,7 @@ async def room_lights(backend, catalog, args):
     devices = [device for device in candidates if device["room_light"]]
     if not devices:
         return [f"No lights found in the Smart Life room {room}."]
+    selected.extend((device["path"], None) for device in devices)
     await asyncio.gather(*(hydrate_device(backend, device) for device in devices))
     if on is None:
         return await asyncio.gather(*(read_status(backend, device, power_code(device)) for device in devices))
@@ -440,11 +441,13 @@ async def read_power_history(backend, device):
     return f"{status} I found no recent accepted power command in the history."
 
 
-async def execute(backend, catalog, call):
+async def execute(backend, catalog, call, *, selected=None):
     name = call["name"]
     if name not in {tool["name"] for tool in TOOLS}:
         raise ValueError("Unknown tool")
     args = json.loads(call["arguments"])
+    if selected is None:
+        selected = []
     if name == "explain_no_action":
         reasons = {
             "unclear_request": "I couldn't tell what you wanted the device to do.",
@@ -455,7 +458,7 @@ async def execute(backend, catalog, call):
         }
         return [f"No command sent. {reasons[args['reason']]}"]
     if name == "room_lights":
-        return await room_lights(backend, catalog, args)
+        return await room_lights(backend, catalog, args, selected)
     ids = args["device_ids"]
     if (
         not isinstance(ids, list) or not ids
@@ -464,6 +467,13 @@ async def execute(backend, catalog, call):
         raise ValueError("Unknown device")
     devices = [catalog[ident] for ident in dict.fromkeys(ids)]
     await asyncio.gather(*(hydrate_device(backend, device) for device in devices))
+    code = args.get("capability")
+    for device in devices:
+        channel = (
+            code if isinstance(code, str) and CHANNEL.fullmatch(code)
+            and code in device["capabilities"] else None
+        )
+        selected.append((device["path"], channel))
     if name == "get_power_history":
         return await asyncio.gather(*(read_power_history(backend, device) for device in devices))
     if name == "get_device_controls":

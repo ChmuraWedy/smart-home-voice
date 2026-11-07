@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import secrets
+import time
 from pathlib import Path
 from typing import Annotated
 
@@ -21,6 +22,32 @@ logger = logging.getLogger("uvicorn.error")
 FORMATS = {
     "audio/webm": "webm", "audio/mp4": "mp4", "audio/ogg": "ogg", "audio/wav": "wav",
 }
+CONTEXT_TTL = 300
+MAX_CONTEXTS = 256
+recent_targets = {}
+
+
+def previous_targets(session_id, catalog):
+    saved = recent_targets.get(session_id)
+    if not saved or saved[0] <= time.monotonic():
+        recent_targets.pop(session_id, None)
+        return []
+    ids = {device["path"]: ident for ident, device in catalog.items()}
+    if any(path not in ids for path, _ in saved[1]):
+        return []
+    return [
+        {"device_id": ids[path], "channel": channel}
+        for path, channel in saved[1]
+    ]
+
+
+def remember_targets(session_id, selected):
+    if not session_id or not selected:
+        return
+    recent_targets.pop(session_id, None)
+    recent_targets[session_id] = (time.monotonic() + CONTEXT_TTL, tuple(dict.fromkeys(selected)))
+    while len(recent_targets) > MAX_CONTEXTS:
+        del recent_targets[next(iter(recent_targets))]
 
 
 def secret(name):
@@ -46,7 +73,7 @@ def home():
     return FileResponse(Path(__file__).with_name("index.html"), headers={"Cache-Control": "no-store"})
 
 
-async def interpret(audio, media_type, key, catalog):
+async def interpret(audio, media_type, key, catalog, previous=()):
     async with httpx.AsyncClient(
         base_url="https://api.openai.com/v1/",
         headers={"Authorization": f"Bearer {key}"},
@@ -78,6 +105,11 @@ async def interpret(audio, media_type, key, catalog):
                 "For a light color request use set_light_color with its advertised color control. "
                 "When the user asks to change both power and color, include both in that single call. "
                 "Only write for an explicit request. Do not change every channel when one is ambiguous. "
+                "When a follow-up refers to the previous target or gives an action without a target, "
+                "use the previous targets only when the reference is unambiguous. A singular "
+                "reference cannot select one of several previous targets. Keep the exact previous "
+                "channel for power follow-ups if one is supplied. An explicitly named new target "
+                "takes precedence. Context supplies targets only; never repeat a previous action. "
                 "A number alone is ambiguous when more than one room has a light with that number. "
                 "An imperative to turn something on or off or change a setting is a write request, "
                 "in any language. Never substitute a status check for a requested change. "
@@ -87,6 +119,7 @@ async def interpret(audio, media_type, key, catalog):
                 "percentages and format=value for Boolean, enum, HSV or exact API-unit values. "
                 "Cloud numeric metadata is in raw ticks; convert using cloud_scale when the units are "
                 "explicit and the mapping is known. HSV uses h=0..360, s/v=0..1000. "
+                f"Previous targets in this tab: {json.dumps(previous)}. "
                 f"Catalog: {json.dumps(model_catalog(catalog), ensure_ascii=False)}"
             ),
             "input": transcript,
@@ -103,6 +136,9 @@ async def command(request: Request):
     # A cross-origin form cannot add this header, and this app does not allow CORS.
     if request.headers.get("x-voice-command") != "1":
         raise HTTPException(403, "Open the voice page to send a command.")
+    session_id = request.headers.get("x-voice-session", "")
+    if not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", session_id):
+        session_id = ""
     key = secret("OPENAI_API_KEY")
     try:
         labels = json.loads(os.getenv("VOICE_DEVICES") or os.getenv("VOICE_LIGHTS") or "{}")
@@ -145,7 +181,9 @@ async def command(request: Request):
     ) as backend:
         try:
             catalog = await load_catalog(backend, labels, cloud_ids, cloud_labels, auto_tuya=auto_tuya)
-            transcript, calls = await interpret(bytes(audio), media_type, key, catalog)
+            transcript, calls = await interpret(
+                bytes(audio), media_type, key, catalog, previous_targets(session_id, catalog),
+            )
         except (httpx.HTTPError, ValueError, TypeError, KeyError, AttributeError):
             raise HTTPException(502, "Could not load the device catalog or interpret the recording.") from None
         if not catalog:
@@ -162,6 +200,7 @@ async def command(request: Request):
         if "explain_no_action" in call_names:
             calls = [call for call in calls if call["name"] == "explain_no_action"][:1]
         messages = []
+        selected = []
         status_only = True
         for call in calls:
             try:
@@ -169,10 +208,11 @@ async def command(request: Request):
                     call["name"] in ("get_device_status", "get_power_history")
                     or (call["name"] == "room_lights" and json.loads(call["arguments"])["on"] is None)
                 )
-                messages.extend(await execute(backend, catalog, call))
+                messages.extend(await execute(backend, catalog, call, selected=selected))
             except (ValueError, TypeError, KeyError):
                 status_only = False
                 messages.append("Could not match one request to a configured device or control.")
+        remember_targets(session_id, selected)
     if status_only:
         messages.insert(0, "Status check only. No device command was sent.")
     return {"transcript": transcript, "message": " ".join(messages)}

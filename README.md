@@ -6,6 +6,9 @@ OpenAI transcribes the audio and selects tools from the registered device catalo
 Ask for device status, saved device or channel aliases, supported controls, or
 changes such as power, level, color, mode, or a timer. The app displays the transcript
 and backend result and reads the result aloud in browsers that support speech synthesis.
+Follow-up commands such as “make it red” can refer to the last selected device in
+the same open page for five minutes. The server keeps only the selected targets
+in memory. Naming a different device overrides that context.
 
 Commands use the selected device's effective definitions. Local controls accept
 mapped Boolean, numeric, string/enum, and encoded HSV values. Tuya Sharing controls

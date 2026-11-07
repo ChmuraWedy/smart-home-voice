@@ -43,6 +43,7 @@
   const status = document.querySelector('#status');
   const transcript = document.querySelector('#transcript');
   let recorder;
+  const voiceSession = globalThis.crypto?.randomUUID?.();
 
   button.addEventListener('click', async () => {
     if (recorder?.state === 'recording') {
@@ -82,7 +83,10 @@
           status.textContent = 'Transcribing and running command…';
           const response = await fetch('/command', {
             method: 'POST',
-            headers: { 'X-Voice-Command': '1' },
+            headers: {
+              'X-Voice-Command': '1',
+              ...(voiceSession && { 'X-Voice-Session': voiceSession }),
+            },
             body: new Blob(chunks, { type }),
           });
           const result = await response.json();
