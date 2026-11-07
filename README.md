@@ -84,3 +84,15 @@ tag to a registry that node can reach. Deploy with the registry-qualified
 
 Open `https://YOUR_VOICE_HOST:8011`, sign in with username `voice`, and grant
 microphone access. Check a configured light with an on or off command.
+
+## Deploy with Compose on the Dell
+
+The Compose file uses Linux host networking to reach the existing backend at
+`127.0.0.1:8000`. Build the image with `docker build -t "$VOICE_IMAGE" .`.
+Set `VOICE_IMAGE`, `VOICE_LIGHTS`, and `VOICE_SECRETS_DIR` before running
+`docker compose up -d --wait`.
+
+Put `voice.crt`, `voice.key`, `password`, `openai-key`, and `backend-token`
+in the secrets directory. The container runs as UID/GID 10001, which needs read
+access to the files and search access to the directory. Keep the TLS CA private
+key outside that directory. Open the Dell's HTTPS address on port 8011.
