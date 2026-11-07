@@ -3,7 +3,8 @@
 A separate one-button browser app for smart-home-service. Tap to start recording,
 then tap again to send. The app also sends automatically after 15 seconds.
 OpenAI transcribes the audio and returns a function call. The app can only turn
-configured lights on or off. It displays the transcript and the backend result.
+configured lights on or off or check their state. It displays the transcript and
+backend result and reads the result aloud in browsers that support speech synthesis.
 
 ## Run locally
 
@@ -22,7 +23,7 @@ starting the voice app.
 | `VOICE_MODEL` | Optional function-calling model override |
 
 Use device IDs from the existing backend's `GET /api/v1/devices` response.
-Only include lights that support the backend's on and off commands.
+Include lights with a configured `switch` or `switch_led` capability.
 
 ```sh
 python -m uvicorn app:app --host 127.0.0.1 --port 8011

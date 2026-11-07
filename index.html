@@ -51,6 +51,7 @@
       return;
     }
 
+    window.speechSynthesis?.cancel();
     transcript.textContent = '';
     if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
       status.textContent = 'Open this page over trusted HTTPS to use the microphone.';
@@ -88,6 +89,11 @@
           if (!response.ok) throw new Error(result.detail || 'Command failed.');
           status.textContent = result.message;
           transcript.textContent = result.transcript;
+          if (window.speechSynthesis && window.SpeechSynthesisUtterance) {
+            const reply = new SpeechSynthesisUtterance(result.message);
+            reply.lang = 'en';
+            window.speechSynthesis.speak(reply);
+          }
         } catch (error) {
           status.textContent = error.message || 'Command failed. Tap to try again.';
         } finally {
