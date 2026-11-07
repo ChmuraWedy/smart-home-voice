@@ -1,5 +1,6 @@
 """Standalone LAN voice interface for smart-home-service."""
 
+import asyncio
 import json
 import logging
 import os
@@ -10,11 +11,20 @@ from pathlib import Path
 from typing import Annotated
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import (
+    Depends,
+    FastAPI,
+    HTTPException,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from websockets.exceptions import WebSocketException
 
 from controls import TOOLS, execute, load_catalog, model_catalog, result_json
+from live import StreamError, stream_transcript
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 basic = HTTPBasic()
@@ -25,6 +35,7 @@ FORMATS = {
 CONTEXT_TTL = 300
 MAX_CONTEXTS = 256
 recent_targets = {}
+stream_tickets = {}
 
 
 def previous_targets(session_id, catalog):
@@ -73,19 +84,25 @@ def home():
     return FileResponse(Path(__file__).with_name("index.html"), headers={"Cache-Control": "no-store"})
 
 
-async def interpret(audio, media_type, key, catalog, previous=()):
+async def transcribe(audio, media_type, key):
     async with httpx.AsyncClient(
         base_url="https://api.openai.com/v1/",
         headers={"Authorization": f"Bearer {key}"},
         timeout=45,
     ) as client:
-        transcript = result_json(await client.post(
+        return result_json(await client.post(
             "audio/transcriptions",
             data={"model": "gpt-transcribe"},
             files={"file": (f"command.{FORMATS[media_type]}", audio, media_type)},
         ))["text"].strip()
-        if not transcript:
-            return transcript, []
+
+
+async def interpret(transcript, key, catalog, previous):
+    async with httpx.AsyncClient(
+        base_url="https://api.openai.com/v1/",
+        headers={"Authorization": f"Bearer {key}"},
+        timeout=45,
+    ) as client:
         response = result_json(await client.post("responses", json={
             "model": os.getenv("VOICE_MODEL", "gpt-5.6-terra"),
             "store": False,
@@ -128,18 +145,92 @@ async def interpret(audio, media_type, key, catalog, previous=()):
         }))
     if response["status"] != "completed":
         raise ValueError("Incomplete model response")
-    return transcript, [item for item in response["output"] if item["type"] == "function_call"]
+    return [item for item in response["output"] if item["type"] == "function_call"]
 
 
-@app.post("/command", dependencies=[Depends(authenticate)])
-async def command(request: Request):
+def voice_session(request):
     # A cross-origin form cannot add this header, and this app does not allow CORS.
     if request.headers.get("x-voice-command") != "1":
         raise HTTPException(403, "Open the voice page to send a command.")
     session_id = request.headers.get("x-voice-session", "")
     if not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", session_id):
         session_id = ""
+    return session_id
+
+
+@app.get("/pcm.js", dependencies=[Depends(authenticate)])
+def audio_worklet():
+    return FileResponse(Path(__file__).with_name("pcm.js"), headers={"Cache-Control": "no-store"})
+
+
+@app.post("/stream-ticket", dependencies=[Depends(authenticate)])
+async def stream_ticket(request: Request):
+    session_id = voice_session(request)
+    ticket = secrets.token_urlsafe(24)
+    stream_tickets[ticket] = (time.monotonic() + 30, session_id)
+    while len(stream_tickets) > MAX_CONTEXTS:
+        del stream_tickets[next(iter(stream_tickets))]
+    return {"ticket": ticket}
+
+
+@app.websocket("/live")
+async def live_command(socket: WebSocket):
+    scheme = "https" if socket.url.scheme == "wss" else "http"
+    if socket.headers.get("origin") != f"{scheme}://{socket.url.netloc}":
+        await socket.close(code=1008)
+        return
+
+    await socket.accept()
+    try:
+        ticket = await asyncio.wait_for(socket.receive_text(), timeout=5)
+        saved = stream_tickets.pop(ticket, None)
+        if not saved or saved[0] <= time.monotonic():
+            await socket.close(code=1008)
+            return
+        key = secret("OPENAI_API_KEY")
+        if not key:
+            raise StreamError("Set OPENAI_API_KEY on the server.")
+        transcript = await stream_transcript(socket, key)
+        await socket.send_json({"type": "transcript", "text": transcript})
+        result = await run_command(transcript, key, saved[1])
+        await socket.send_json({"type": "result", **result})
+    except WebSocketDisconnect:
+        return
+    except (StreamError, HTTPException) as error:
+        message = error.detail if isinstance(error, HTTPException) else str(error)
+        await socket.send_json({"type": "error", "message": message})
+    except (OSError, TimeoutError, WebSocketException, ValueError, KeyError) as error:
+        logger.warning("Live voice session failed: %s", type(error).__name__)
+        await socket.send_json({"type": "error", "message": "Live transcription disconnected. Tap to try again."})
+    await socket.close()
+
+
+@app.post("/command", dependencies=[Depends(authenticate)])
+async def command(request: Request):
+    session_id = voice_session(request)
     key = secret("OPENAI_API_KEY")
+    if not key:
+        raise HTTPException(503, "Set OPENAI_API_KEY on the server.")
+    media_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
+    if media_type not in FORMATS:
+        raise HTTPException(415, "This recording format is unsupported.")
+    audio = bytearray()
+    async for chunk in request.stream():
+        if len(audio) + len(chunk) > 2 * 1024 * 1024:
+            raise HTTPException(413, "Recording is too large.")
+        audio.extend(chunk)
+    if not audio:
+        raise HTTPException(400, "No audio was recorded.")
+    try:
+        transcript = await transcribe(bytes(audio), media_type, key)
+    except (httpx.HTTPError, ValueError, TypeError, KeyError, AttributeError):
+        raise HTTPException(502, "Could not transcribe the recording.") from None
+    return await run_command(transcript, key, session_id)
+
+
+async def run_command(transcript, key, session_id):
+    if not transcript:
+        return {"transcript": "", "message": "No speech detected. Try again."}
     try:
         labels = json.loads(os.getenv("VOICE_DEVICES") or os.getenv("VOICE_LIGHTS") or "{}")
         auto_tuya = os.getenv("VOICE_AUTO_TUYA") == "1"
@@ -158,20 +249,6 @@ async def command(request: Request):
             raise ValueError
     except (ValueError, TypeError):
         raise HTTPException(503, "Check the server's voice device configuration.") from None
-    if not key:
-        raise HTTPException(503, "Set OPENAI_API_KEY on the server.")
-
-    media_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
-    if media_type not in FORMATS:
-        raise HTTPException(415, "This recording format is unsupported.")
-    audio = bytearray()
-    async for chunk in request.stream():
-        if len(audio) + len(chunk) > 2 * 1024 * 1024:
-            raise HTTPException(413, "Recording is too large.")
-        audio.extend(chunk)
-    if not audio:
-        raise HTTPException(400, "No audio was recorded.")
-
     token = secret("SMART_HOME_API_TOKEN")
     headers = {"X-API-Key": token} if token else {}
     async with httpx.AsyncClient(
@@ -181,9 +258,7 @@ async def command(request: Request):
     ) as backend:
         try:
             catalog = await load_catalog(backend, labels, cloud_ids, cloud_labels, auto_tuya=auto_tuya)
-            transcript, calls = await interpret(
-                bytes(audio), media_type, key, catalog, previous_targets(session_id, catalog),
-            )
+            calls = await interpret(transcript, key, catalog, previous_targets(session_id, catalog))
         except (httpx.HTTPError, ValueError, TypeError, KeyError, AttributeError):
             raise HTTPException(502, "Could not load the device catalog or interpret the recording.") from None
         if not catalog:

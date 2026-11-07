@@ -2,7 +2,10 @@
 
 A separate one-button browser app for smart-home-service. Tap to start recording,
 then tap again to send. The app also sends automatically after 15 seconds.
-OpenAI transcribes the audio and selects tools from the registered device catalog.
+OpenAI streams partial transcription while you speak. The final transcript
+selects tools from the registered device catalog after the recording stops.
+If live setup is unavailable, the app displays upload mode and transcribes
+the completed recording.
 Ask for device status, saved device or channel aliases, supported controls, or
 changes such as power, level, color, mode, or a timer. The app displays the transcript
 and backend result and reads the result aloud in browsers that support speech synthesis.
