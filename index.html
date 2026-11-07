@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Home Voice</title>
+  <style>
+    :root { color-scheme: dark; font: 16px system-ui, sans-serif; }
+    body { margin: 0; background: #111214; color: #f5f5f5; }
+    main { min-height: 100svh; display: grid; place-content: center; text-align: center; padding: 0 24px; }
+    h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 32px; }
+    button {
+      display: grid; place-items: center; margin: auto; width: 120px; height: 120px;
+      border-radius: 50%; border: 1px solid #e6efff; color: #101927; cursor: pointer;
+      background: radial-gradient(circle at 36% 22%, #fff 8%, #dcf4ff 36%, #9bb9f2 72%, #a9a2ed);
+      box-shadow: 0 0 54px #8bacf654; touch-action: manipulation;
+    }
+    button:focus-visible { outline: 3px solid white; outline-offset: 7px; }
+    button:disabled { opacity: .65; cursor: wait; }
+    button[aria-pressed="true"] { background: #ffc7c5; box-shadow: 0 0 54px #ff928975; }
+    button[aria-pressed="true"] svg:first-child, button[aria-pressed="false"] svg:last-child { display: none; }
+    p { margin: 18px auto 0; max-width: 32rem; overflow-wrap: anywhere; }
+    #transcript { margin-top: 8px; color: #b1b4bc; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Home Voice</h1>
+  <button id="voice" aria-label="Voice recording" aria-pressed="false">
+    <svg aria-hidden="true" width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+      <rect x="9" y="2" width="6" height="13" rx="3"/>
+      <path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3m-3 0h6"/>
+    </svg>
+    <svg aria-hidden="true" width="38" height="38" viewBox="0 0 24 24" fill="currentColor">
+      <rect x="5" y="5" width="14" height="14" rx="3"/>
+    </svg>
+  </button>
+  <p id="status" role="status">Tap to speak</p>
+  <p id="transcript"></p>
+</main>
+<script>
+  const button = document.querySelector('#voice');
+  const status = document.querySelector('#status');
+  const transcript = document.querySelector('#transcript');
+  let recorder;
+
+  button.addEventListener('click', async () => {
+    if (recorder?.state === 'recording') {
+      recorder.stop();
+      button.disabled = true;
+      return;
+    }
+
+    transcript.textContent = '';
+    if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+      status.textContent = 'Open this page over trusted HTTPS to use the microphone.';
+      return;
+    }
+
+    let stream;
+    button.disabled = true;
+    status.textContent = 'Opening microphone…';
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      recorder = new MediaRecorder(stream);
+      const chunks = [];
+      let failed = false;
+      recorder.ondataavailable = event => {
+        if (event.data.size) chunks.push(event.data);
+      };
+      recorder.onerror = () => { failed = true; };
+      recorder.onstop = async () => {
+        clearTimeout(limit);
+        stream.getTracks().forEach(track => track.stop());
+        const type = recorder.mimeType || chunks[0]?.type;
+        recorder = undefined;
+        button.disabled = true;
+        button.setAttribute('aria-pressed', 'false');
+        try {
+          if (failed || !chunks.length) throw new Error('Recording failed. Tap to try again.');
+          status.textContent = 'Transcribing and running command…';
+          const response = await fetch('/command', {
+            method: 'POST',
+            headers: { 'X-Voice-Command': '1' },
+            body: new Blob(chunks, { type }),
+          });
+          const result = await response.json();
+          if (!response.ok) throw new Error(result.detail || 'Command failed.');
+          status.textContent = result.message;
+          transcript.textContent = result.transcript;
+        } catch (error) {
+          status.textContent = error.message || 'Command failed. Tap to try again.';
+        } finally {
+          button.disabled = false;
+        }
+      };
+      recorder.start();
+      const limit = setTimeout(() => {
+        if (recorder?.state === 'recording') recorder.stop();
+      }, 15000);
+      button.setAttribute('aria-pressed', 'true');
+      status.textContent = 'Listening… Tap to send';
+    } catch {
+      stream?.getTracks().forEach(track => track.stop());
+      recorder = undefined;
+      status.textContent = 'Microphone unavailable. Check browser permissions and try again.';
+    } finally {
+      button.disabled = false;
+    }
+  });
+</script>
+</body>
+</html>
