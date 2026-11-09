@@ -44,12 +44,26 @@ stream_tickets = {}
 
 def previous_targets(conversation, catalog):
     ids = {device["path"]: ident for ident, device in catalog.items()}
-    if any(path not in ids for path, _ in conversation.targets):
-        return []
     return [
-        {"device_id": ids[path], "channel": channel}
+        {"device_id": ids[path], "channel": channel, "name": catalog[ids[path]].get("name")}
         for path, channel in conversation.targets
+        if path in ids
     ]
+
+
+def recent_light_check(transcript, catalog, previous):
+    # Resolve explicit read-only retries before the model considers the full catalog.
+    request = re.fullmatch(r"(?:check|read) (?:the )?(?:light|lamp|bulb)\s*(\d+) again[.!?]?", transcript, re.I)
+    if not request:
+        return []
+    numbered_light = re.compile(r"(?:light(?:ing)?|lamp|bulb)[ _-]*" + request[1] + r"\s*$", re.I)
+    matches = {}
+    for target in previous:
+        ident = target["device_id"]
+        device = catalog[ident]
+        if any(numbered_light.search(name) for name in [device["name"], *device["aliases"]]):
+            matches[ident] = target["channel"]
+    return list(matches.items())
 
 
 def secret(name):
@@ -198,12 +212,15 @@ async def interpret(transcript, key, catalog, previous, history):
                 "Only the latest user message can authorize a write. Earlier turns are context only. "
                 "Do not repeat an earlier command unless the latest user message asks for it. "
                 "Do not change every channel when one is ambiguous. "
-                "When a follow-up refers to the previous target or gives an action without a target, "
-                "use the previous targets only when the reference is unambiguous. A singular "
-                "reference cannot select one of several previous targets. Keep the exact previous "
-                "channel for power follow-ups if one is supplied. An explicitly named new target "
-                "takes precedence. Context supplies targets only; never repeat a previous action. "
-                "A number alone is ambiguous when more than one room has a light with that number. "
+                "For a follow-up such as 'check light 2 again', match the shorthand name or number "
+                "against the recent targets before considering the rest of the catalog. If exactly "
+                "one recent target matches, use it even when other rooms have the same number. "
+                "Treat check or check again as a status read, regardless of the previous operation. "
+                "Ask for clarification if multiple recent targets still match. If the user answers a "
+                "clarification for a status read with a device name, finish that status read. "
+                "Keep the exact previous "
+                "channel when it applies. An explicitly named new target takes precedence. "
+                "When there is no relevant prior context, the same number in multiple rooms is ambiguous. "
                 "An imperative to turn something on or off or change a setting is a write request, "
                 "in any language. Never substitute a status check for a requested change. "
                 "Use explain_no_action when the request is unclear, unsupported, or missing a "
@@ -414,9 +431,21 @@ async def answer_command(transcript, key, conversation, delegated_key):
             catalog = await load_catalog(
                 backend, labels, cloud_ids, cloud_labels, auto_tuya=auto_tuya, delegated=bool(delegated_key),
             )
-            calls = await interpret(
-                transcript, key, catalog, previous_targets(conversation, catalog), conversation.turns,
-            )
+            previous = previous_targets(conversation, catalog)
+            matches = recent_light_check(transcript, catalog, previous)
+            if len(matches) > 1:
+                names = ", ".join(catalog[ident]["name"] for ident, _ in matches)
+                return chat_result(transcript, [Answer(
+                    "Home Voice", f"Which light did you mean? Recent matches: {names}.", "clarify",
+                )])
+            if matches:
+                ident, channel = matches[0]
+                calls = [{
+                    "name": "get_device_status",
+                    "arguments": json.dumps({"device_ids": [ident], "capability": channel}),
+                }]
+            else:
+                calls = await interpret(transcript, key, catalog, previous, conversation.turns)
         except (httpx.HTTPError, ValueError, TypeError, KeyError, AttributeError):
             raise HTTPException(502, "Could not load the device catalog or interpret the recording.") from None
         if not catalog:

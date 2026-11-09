@@ -1,8 +1,11 @@
+import asyncio
+import json
+
 import httpx
 from fastapi.testclient import TestClient
 
 import app as voice
-from chat_session import Sessions
+from chat_session import Conversation, Sessions
 
 TICKET = "t" * 43
 DELEGATED = "shc_" + "s" * 43
@@ -21,8 +24,6 @@ def test_ticket_auth_and_full_conversation_per_panel(monkeypatch):
     def handle(request):
         requests.append((request.url.path, request.headers.get("X-API-Key")))
         if request.url.path == "/api/v1/assistant/session":
-            import json
-
             ticket = json.loads(request.content)["ticket"]
             if ticket not in unused:
                 return httpx.Response(401, json={})
@@ -85,3 +86,77 @@ def test_ticket_auth_and_full_conversation_per_panel(monkeypatch):
         assert client.post("/embed/command", headers=headers, json={"text": "Revoked"}).status_code == 401
         assert conversations[-1] == ("New", [])
     assert all(key == DELEGATED for path, key in requests if path.endswith("/accounts/me"))
+
+
+def test_numbered_light_follow_up_uses_recent_matches(monkeypatch):
+    lights = {
+        "1": "WorkRoomLamp1",
+        "2": "WorkRoomLamp2",
+        "3": "WorkRoom Lighting 2",
+        "4": "Kitchen Light 2",
+    }
+    catalog = {
+        ident: {"name": name, "aliases": [], "channels": {}, "path": f"devices/{ident}"}
+        for ident, name in lights.items()
+    }
+    first = "set brightness 20% for all ligth in work room"
+    follow_up = "check light 2 again"
+    command_calls = []
+    model_requests = []
+
+    def dashboard_api(key):
+        return httpx.AsyncClient(
+            base_url="http://dashboard.test/api/v1/",
+            transport=httpx.MockTransport(lambda request: httpx.Response(200)),
+        )
+
+    async def load_catalog(*args, **kwargs):
+        return catalog
+
+    async def interpret(text, key, available, previous, history):
+        model_requests.append(text)
+        if text != first:
+            return []
+        return [{
+            "name": "set_device_control",
+            "arguments": json.dumps({"device_ids": ["1", "2", "3"], "capability": "brightness"}),
+        }]
+
+    async def execute(backend, available, call, *, selected):
+        args = json.loads(call["arguments"])
+        command_calls.append((call["name"], args["device_ids"]))
+        selected.extend((available[ident]["path"], None) for ident in args["device_ids"])
+        return [
+            voice.Answer(available[ident]["name"], "Test result.", "offline" if ident == "3" else "state")
+            for ident in args["device_ids"]
+        ]
+
+    monkeypatch.setattr(voice, "dashboard_api", dashboard_api)
+    monkeypatch.setattr(voice, "load_catalog", load_catalog)
+    monkeypatch.setattr(voice, "interpret", interpret)
+    monkeypatch.setattr(voice, "execute", execute)
+
+    async def run():
+        conversation = Conversation()
+        await voice.answer_command(first, "model-key", conversation, DELEGATED)
+        reply = await voice.answer_command(follow_up, "model-key", conversation, DELEGATED)
+        assert reply["cards"][0]["status"] == "clarify"
+        assert "WorkRoomLamp2, WorkRoom Lighting 2" in reply["message"]
+        assert "Kitchen Light 2" not in reply["message"]
+        assert command_calls == [("set_device_control", ["1", "2", "3"])]
+
+        del catalog["3"]
+        reply = await voice.answer_command(follow_up, "model-key", conversation, DELEGATED)
+        assert reply["cards"][0]["title"] == "WorkRoomLamp2"
+        assert command_calls[-1] == ("get_device_status", ["2"])
+        assert reply["message"].startswith("Status check only.")
+
+        mixed_request = "check light 2 again and turn it off"
+        await voice.answer_command(mixed_request, "model-key", conversation, DELEGATED)
+        assert model_requests == [first, mixed_request]
+        assert command_calls == [
+            ("set_device_control", ["1", "2", "3"]),
+            ("get_device_status", ["2"]),
+        ]
+
+    asyncio.run(run())
