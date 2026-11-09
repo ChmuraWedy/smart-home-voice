@@ -181,13 +181,13 @@ async def fetch_cloud(backend, auto_tuya):
     return result_json(await backend.get("cloud/devices", params=params, timeout=5))
 
 
-async def room_placements(backend):
+async def room_placements(backend, *, allow_sync=True):
     global _last_topology_sync
     try:
         topology = result_json(await backend.get("cloud/topology"))
         timestamp = topology.get("synced_at")
         stale = not timestamp or (datetime.now(timezone.utc) - datetime.fromisoformat(timestamp)).days >= 1
-        if (stale and topology["job"]["status"] != "running"
+        if (allow_sync and stale and topology["job"]["status"] != "running"
                 and time.monotonic() - _last_topology_sync >= AUTO_REFRESH_INTERVAL):
             _last_topology_sync = time.monotonic()
             await backend.post("cloud/topology/sync", timeout=4)
@@ -219,9 +219,11 @@ def apply_room(device, remote, placement, room_names):
     )
 
 
-async def load_catalog(backend, labels, cloud_ids, cloud_labels=None, *, auto_tuya=False):
+async def load_catalog(backend, labels, cloud_ids, cloud_labels=None, *, auto_tuya=False, delegated=False):
     cloud_labels = cloud_labels or {}
-    rows = result_json(await backend.get("devices")) if labels else []
+    rows = result_json(await backend.get("devices")) if labels or delegated else []
+    if delegated:
+        labels = {str(row["id"]): labels.get(str(row["id"]), row["name"]) for row in rows}
     try:
         cloud = {row["id"]: row for row in await fetch_cloud(backend, auto_tuya)}
     except (httpx.HTTPError, ValueError):
@@ -233,7 +235,7 @@ async def load_catalog(backend, labels, cloud_ids, cloud_labels=None, *, auto_tu
     }
     await asyncio.gather(*(refresh_cloud_definitions(backend, cloud[ident])
                            for ident in cloud_targets if ident in cloud))
-    placements = await room_placements(backend) if auto_tuya and cloud else {}
+    placements = await room_placements(backend, allow_sync=not delegated) if auto_tuya and cloud else {}
     room_names = {placement[2].casefold() for placement in placements.values()}
     catalog = {}
     for row in rows:

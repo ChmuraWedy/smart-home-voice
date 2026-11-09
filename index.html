@@ -114,6 +114,42 @@
     'X-Voice-Command': '1',
     ...(voiceSession && { 'X-Voice-Session': voiceSession }),
   };
+  const embedded = location.pathname === '/embed';
+  const commandPath = embedded ? '/embed/command' : '/command';
+  const streamPath = embedded ? '/embed/stream-ticket' : '/stream-ticket';
+  const pcmPath = embedded ? '/embed/pcm.js' : '/pcm.js';
+
+  async function signIn() {
+    const ticket = new URLSearchParams(location.hash.slice(1)).get('ticket');
+    history.replaceState(null, '', location.pathname);
+    button.disabled = send.disabled = true;
+    status.textContent = 'Signing in…';
+    if (ticket) {
+      try {
+        const response = await fetch('/embed/session', {
+          method: 'POST', headers: {...headers, 'Content-Type': 'application/json'},
+          body: JSON.stringify({ticket}),
+        });
+        if (response.ok) {
+          const {session} = await response.json();
+          headers.Authorization = 'Bearer ' + session;
+          button.disabled = send.disabled = false;
+          status.textContent = 'Tap to speak';
+          return;
+        }
+      } catch {}
+    }
+    status.textContent = 'Chat sign-in expired. Close and reopen AI chat.';
+  }
+
+  if (embedded) {
+    void signIn();
+    window.addEventListener('pagehide', () => {
+      if (headers.Authorization) {
+        void fetch('/embed/session/close', {method: 'POST', headers, keepalive: true}).catch(() => {});
+      }
+    });
+  }
   let stopRecording;
   let limit;
 
@@ -222,7 +258,7 @@
     showTranscript(text);
     processing('Running command…');
     try {
-      const response = await fetch('/command', {
+      const response = await fetch(commandPath, {
         method: 'POST', headers: {...headers, 'Content-Type': 'application/json'},
         body: JSON.stringify({text}),
       });
@@ -242,8 +278,8 @@
 
   async function liveRecording(stream, context) {
     const [response] = await Promise.all([
-      fetch('/stream-ticket', { method: 'POST', headers, signal: AbortSignal.timeout?.(8000) }),
-      context.audioWorklet.addModule('/pcm.js'),
+      fetch(streamPath, { method: 'POST', headers, signal: AbortSignal.timeout?.(8000) }),
+      context.audioWorklet.addModule(pcmPath),
     ]);
     if (!response.ok) throw new Error('Could not start live transcription.');
     const { ticket } = await response.json();
@@ -333,7 +369,7 @@
       processing('Transcribing and running command…');
       try {
         if (failed || !chunks.length) throw new Error('Recording failed. Tap to try again.');
-        const response = await fetch('/command', {
+        const response = await fetch(commandPath, {
           method: 'POST', headers,
           body: new Blob(chunks, { type: recorder.mimeType || chunks[0].type }),
         });

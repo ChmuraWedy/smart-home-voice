@@ -10,6 +10,7 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import (
@@ -20,10 +21,12 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from pydantic import BaseModel, Field
 from websockets.exceptions import WebSocketException
 
+from chat_session import MAX_TURNS, Conversation, EmbedSession, Sessions
 from controls import TOOLS, Answer, execute, load_catalog, model_catalog, result_json
 from live import StreamError, stream_transcript
 
@@ -33,33 +36,20 @@ logger = logging.getLogger("uvicorn.error")
 FORMATS = {
     "audio/webm": "webm", "audio/mp4": "mp4", "audio/ogg": "ogg", "audio/wav": "wav",
 }
-CONTEXT_TTL = 300
 MAX_CONTEXTS = 256
-recent_targets = {}
+standalone_conversations = Sessions()
+embedded_conversations = Sessions()
 stream_tickets = {}
 
 
-def previous_targets(session_id, catalog):
-    saved = recent_targets.get(session_id)
-    if not saved or saved[0] <= time.monotonic():
-        recent_targets.pop(session_id, None)
-        return []
+def previous_targets(conversation, catalog):
     ids = {device["path"]: ident for ident, device in catalog.items()}
-    if any(path not in ids for path, _ in saved[1]):
+    if any(path not in ids for path, _ in conversation.targets):
         return []
     return [
         {"device_id": ids[path], "channel": channel}
-        for path, channel in saved[1]
+        for path, channel in conversation.targets
     ]
-
-
-def remember_targets(session_id, selected):
-    if not session_id or not selected:
-        return
-    recent_targets.pop(session_id, None)
-    recent_targets[session_id] = (time.monotonic() + CONTEXT_TTL, tuple(dict.fromkeys(selected)))
-    while len(recent_targets) > MAX_CONTEXTS:
-        del recent_targets[next(iter(recent_targets))]
 
 
 def secret(name):
@@ -85,6 +75,89 @@ def home():
     return FileResponse(Path(__file__).with_name("index.html"), headers={"Cache-Control": "no-store"})
 
 
+def dashboard_origins():
+    origins = os.getenv("VOICE_DASHBOARD_ORIGIN", "").split()
+    if not origins:
+        raise HTTPException(404, "Dashboard chat is unavailable.")
+    for origin in origins:
+        url = urlsplit(origin)
+        if (
+            url.scheme not in {"http", "https"} or not url.hostname
+            or url.username or url.password or url.path or url.query or url.fragment
+            or not re.fullmatch(r"https?://[A-Za-z0-9.:-]+", origin)
+        ):
+            raise HTTPException(404, "Dashboard chat is unavailable.")
+    return " ".join(origins)
+
+
+def dashboard_api(key=None):
+    return httpx.AsyncClient(
+        base_url=os.getenv("VOICE_BACKEND_URL", "http://127.0.0.1:8000").rstrip("/") + "/api/v1/",
+        headers={"X-API-Key": key} if key else {},
+        timeout=15,
+    )
+
+
+async def verify_dashboard_key(backend):
+    auth = await backend.get("accounts/me")
+    if auth.status_code in {401, 403}:
+        raise HTTPException(401, "Chat sign-in expired. Reopen AI chat.")
+    auth.raise_for_status()
+
+
+async def verify_embed_access(session):
+    try:
+        async with dashboard_api(session.dashboard_key) as backend:
+            await verify_dashboard_key(backend)
+    except httpx.HTTPError:
+        raise HTTPException(502, "Could not connect to dashboard chat.") from None
+
+
+def embedded_session(request):
+    scheme, _, key = request.headers.get("authorization", "").partition(" ")
+    session = embedded_conversations.get(key) if scheme.lower() == "bearer" else None
+    if not session:
+        raise HTTPException(401, "Chat sign-in expired. Reopen AI chat.")
+    return key, session
+
+
+@app.get("/embed")
+def embed():
+    return FileResponse(Path(__file__).with_name("index.html"), headers={
+        "Cache-Control": "no-store",
+        "Content-Security-Policy": f"frame-ancestors {dashboard_origins()}",
+        "Referrer-Policy": "no-referrer",
+    })
+
+
+class SignInTicket(BaseModel):
+    ticket: str = Field(pattern=r"^[A-Za-z0-9_-]{43}$")
+
+
+@app.post("/embed/session")
+async def embed_sign_in(ticket: SignInTicket, request: Request):
+    dashboard_origins()
+    voice_session(request)
+    try:
+        async with dashboard_api() as backend:
+            result = await backend.post("assistant/session", json=ticket.model_dump())
+            if result.status_code == 401:
+                raise HTTPException(401, "Chat sign-in expired. Reopen AI chat.")
+            key = result_json(result)["key"]
+            if not isinstance(key, str) or not key.startswith("shc_"):
+                raise ValueError("Invalid chat session")
+    except (httpx.HTTPError, ValueError, KeyError, TypeError):
+        raise HTTPException(502, "Could not connect to dashboard chat.") from None
+    return JSONResponse({"session": embedded_conversations.open(key)}, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/embed/session/close", status_code=204)
+async def embed_close(request: Request):
+    voice_session(request)
+    key, _ = embedded_session(request)
+    embedded_conversations.close(key)
+
+
 async def transcribe(audio, media_type, key):
     async with httpx.AsyncClient(
         base_url="https://api.openai.com/v1/",
@@ -98,7 +171,7 @@ async def transcribe(audio, media_type, key):
         ))["text"].strip()
 
 
-async def interpret(transcript, key, catalog, previous):
+async def interpret(transcript, key, catalog, previous, history):
     async with httpx.AsyncClient(
         base_url="https://api.openai.com/v1/",
         headers={"Authorization": f"Bearer {key}"},
@@ -122,7 +195,9 @@ async def interpret(transcript, key, catalog, previous):
                 "For why a device is on or off, use get_power_history. "
                 "For a light color request use set_light_color with its advertised color control. "
                 "When the user asks to change both power and color, include both in that single call. "
-                "Only write for an explicit request. Do not change every channel when one is ambiguous. "
+                "Only the latest user message can authorize a write. Earlier turns are context only. "
+                "Do not repeat an earlier command unless the latest user message asks for it. "
+                "Do not change every channel when one is ambiguous. "
                 "When a follow-up refers to the previous target or gives an action without a target, "
                 "use the previous targets only when the reference is unambiguous. A singular "
                 "reference cannot select one of several previous targets. Keep the exact previous "
@@ -140,7 +215,7 @@ async def interpret(transcript, key, catalog, previous):
                 f"Previous targets in this tab: {json.dumps(previous)}. "
                 f"Catalog: {json.dumps(model_catalog(catalog), ensure_ascii=False)}"
             ),
-            "input": transcript,
+            "input": [*history, {"role": "user", "content": transcript}],
             "tools": TOOLS,
             "tool_choice": "required",
         }))
@@ -164,14 +239,38 @@ def audio_worklet():
     return FileResponse(Path(__file__).with_name("pcm.js"), headers={"Cache-Control": "no-store"})
 
 
-@app.post("/stream-ticket", dependencies=[Depends(authenticate)])
-async def stream_ticket(request: Request):
-    session_id = voice_session(request)
+def store_stream_ticket(context):
     ticket = secrets.token_urlsafe(24)
-    stream_tickets[ticket] = (time.monotonic() + 30, session_id)
+    stream_tickets[ticket] = (time.monotonic() + 30, context)
     while len(stream_tickets) > MAX_CONTEXTS:
         del stream_tickets[next(iter(stream_tickets))]
     return {"ticket": ticket}
+
+
+def standalone_conversation(request):
+    session_id = voice_session(request)
+    if not session_id:
+        return Conversation()
+    return standalone_conversations.get(session_id) or standalone_conversations.put(session_id, Conversation())
+
+
+@app.get("/embed/pcm.js")
+def embed_audio_worklet():
+    dashboard_origins()
+    return audio_worklet()
+
+
+@app.post("/stream-ticket", dependencies=[Depends(authenticate)])
+async def stream_ticket(request: Request):
+    return store_stream_ticket(standalone_conversation(request))
+
+
+@app.post("/embed/stream-ticket")
+async def embed_stream_ticket(request: Request):
+    voice_session(request)
+    key, session = embedded_session(request)
+    await verify_embed_access(session)
+    return store_stream_ticket(key)
 
 
 @app.websocket("/live")
@@ -188,12 +287,22 @@ async def live_command(socket: WebSocket):
         if not saved or saved[0] <= time.monotonic():
             await socket.close(code=1008)
             return
+        context = saved[1]
+        if isinstance(context, str):
+            context = embedded_conversations.get(context)
+            if not context:
+                await socket.close(code=1008)
+                return
+            await verify_embed_access(context)
         key = secret("OPENAI_API_KEY")
         if not key:
             raise StreamError("Set OPENAI_API_KEY on the server.")
         transcript = await stream_transcript(socket, key)
         await socket.send_json({"type": "transcript", "text": transcript})
-        result = await run_command(transcript, key, saved[1])
+        if isinstance(saved[1], str) and embedded_conversations.get(saved[1]) is None:
+            await socket.close(code=1008)
+            return
+        result = await run_command(transcript, key, context)
         await socket.send_json({"type": "result", **result})
     except WebSocketDisconnect:
         return
@@ -208,7 +317,17 @@ async def live_command(socket: WebSocket):
 
 @app.post("/command", dependencies=[Depends(authenticate)])
 async def command(request: Request):
-    session_id = voice_session(request)
+    return await process_command(request, standalone_conversation(request))
+
+
+@app.post("/embed/command")
+async def embed_command(request: Request):
+    voice_session(request)
+    _, session = embedded_session(request)
+    return await process_command(request, session)
+
+
+async def process_command(request: Request, context):
     key = secret("OPENAI_API_KEY")
     if not key:
         raise HTTPException(503, "Set OPENAI_API_KEY on the server.")
@@ -232,11 +351,13 @@ async def command(request: Request):
     else:
         if not body:
             raise HTTPException(400, "No audio was recorded.")
+        if isinstance(context, EmbedSession):
+            await verify_embed_access(context)
         try:
             transcript = await transcribe(bytes(body), media_type, key)
         except (httpx.HTTPError, ValueError, TypeError, KeyError, AttributeError):
             raise HTTPException(502, "Could not transcribe the recording.") from None
-    return await run_command(transcript, key, session_id)
+    return await run_command(transcript, key, context)
 
 
 def chat_result(transcript, cards, *, status_only=False):
@@ -249,7 +370,22 @@ def chat_result(transcript, cards, *, status_only=False):
     return {"transcript": transcript, "message": " ".join(spoken), "cards": [asdict(card) for card in cards]}
 
 
-async def run_command(transcript, key, session_id):
+async def run_command(transcript, key, context):
+    delegated = isinstance(context, EmbedSession)
+    conversation = context.conversation if delegated else context
+    async with conversation.lock:
+        if len(conversation.turns) >= 2 * MAX_TURNS:
+            raise HTTPException(409, "This conversation is full. Reopen AI chat to start a new one.")
+        result = await answer_command(transcript, key, conversation, context.dashboard_key if delegated else None)
+        if transcript:
+            conversation.turns.extend([
+                {"role": "user", "content": transcript},
+                {"role": "assistant", "content": result["message"]},
+            ])
+        return result
+
+
+async def answer_command(transcript, key, conversation, delegated_key):
     if not transcript:
         return chat_result("", [Answer("Home Voice", "No speech detected. Try again.", "clarify")])
     try:
@@ -259,7 +395,7 @@ async def run_command(transcript, key, session_id):
         cloud_ids = {part.strip() for part in os.getenv("VOICE_CLOUD_IDS", "").split(",") if part.strip()}
         if not isinstance(labels, dict) or not isinstance(cloud_labels, dict):
             raise TypeError
-        if not (labels or cloud_labels or auto_tuya) or not cloud_ids <= labels.keys():
+        if not (delegated_key or labels or cloud_labels or auto_tuya) or not cloud_ids <= labels.keys():
             raise ValueError
         if any(not isinstance(label, str) or not label.strip()
                for label in (*labels.values(), *cloud_labels.values())):
@@ -270,16 +406,17 @@ async def run_command(transcript, key, session_id):
             raise ValueError
     except (ValueError, TypeError):
         raise HTTPException(503, "Check the server's voice device configuration.") from None
-    token = secret("SMART_HOME_API_TOKEN")
-    headers = {"X-API-Key": token} if token else {}
-    async with httpx.AsyncClient(
-        base_url=os.getenv("VOICE_BACKEND_URL", "http://127.0.0.1:8000").rstrip("/") + "/api/v1/",
-        headers=headers,
-        timeout=15,
-    ) as backend:
+    token = delegated_key or secret("SMART_HOME_API_TOKEN")
+    async with dashboard_api(token) as backend:
         try:
-            catalog = await load_catalog(backend, labels, cloud_ids, cloud_labels, auto_tuya=auto_tuya)
-            calls = await interpret(transcript, key, catalog, previous_targets(session_id, catalog))
+            if delegated_key:
+                await verify_dashboard_key(backend)
+            catalog = await load_catalog(
+                backend, labels, cloud_ids, cloud_labels, auto_tuya=auto_tuya, delegated=bool(delegated_key),
+            )
+            calls = await interpret(
+                transcript, key, catalog, previous_targets(conversation, catalog), conversation.turns,
+            )
         except (httpx.HTTPError, ValueError, TypeError, KeyError, AttributeError):
             raise HTTPException(502, "Could not load the device catalog or interpret the recording.") from None
         if not catalog:
@@ -308,5 +445,6 @@ async def run_command(transcript, key, session_id):
             except (ValueError, TypeError, KeyError):
                 status_only = False
                 cards.append(Answer("Home Voice", "Could not match a request to a device or control.", "clarify"))
-        remember_targets(session_id, selected)
+        if selected:
+            conversation.targets = tuple(dict.fromkeys(selected))
     return chat_result(transcript, cards, status_only=status_only)
