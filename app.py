@@ -112,7 +112,7 @@ def dashboard_api(key=None):
 
 
 async def verify_dashboard_key(backend):
-    auth = await backend.get("accounts/me")
+    auth = await backend.get("devices", params={"limit": 1})
     if auth.status_code in {401, 403}:
         raise HTTPException(401, "Chat sign-in expired. Reopen AI chat.")
     auth.raise_for_status()

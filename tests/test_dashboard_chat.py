@@ -29,7 +29,7 @@ def test_ticket_auth_and_full_conversation_per_panel(monkeypatch):
                 return httpx.Response(401, json={})
             unused.remove(ticket)
             return httpx.Response(200, json={"key": DELEGATED})
-        if request.url.path == "/api/v1/accounts/me":
+        if request.url.path == "/api/v1/devices":
             assert request.headers["X-API-Key"] == DELEGATED
             return httpx.Response(200 if active else 401, json={})
         raise AssertionError(request.url.path)
@@ -85,7 +85,7 @@ def test_ticket_auth_and_full_conversation_per_panel(monkeypatch):
         active = False
         assert client.post("/embed/command", headers=headers, json={"text": "Revoked"}).status_code == 401
         assert conversations[-1] == ("New", [])
-    assert all(key == DELEGATED for path, key in requests if path.endswith("/accounts/me"))
+    assert all(key == DELEGATED for path, key in requests if path.endswith("/devices"))
 
 
 def test_numbered_light_follow_up_uses_recent_matches(monkeypatch):
@@ -178,7 +178,7 @@ def test_model_clarification_lists_permitted_options_before_any_command(monkeypa
     assert any(tool["name"] == "ask_clarification" for tool in voice.TOOLS)
 
     def backend_request(request):
-        assert request.method == "GET" and request.url.path == "/api/v1/accounts/me"
+        assert request.method == "GET" and request.url.path == "/api/v1/devices"
         return httpx.Response(200)
 
     def dashboard_api(key):
@@ -261,7 +261,7 @@ def test_click_resumes_original_command_once_for_selected_channel(monkeypatch):
 
     def backend_request(request):
         assert request.headers["X-API-Key"] == DELEGATED
-        if request.url.path == "/api/v1/accounts/me" and request.method == "GET":
+        if request.url.path == "/api/v1/devices" and request.method == "GET":
             return httpx.Response(200)
         assert request.url.path == "/api/v1/devices/42/commands/capabilities" and request.method == "POST"
         writes.append(json.loads(request.content))
