@@ -32,6 +32,7 @@
     .answer-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 6px 12px; flex-wrap: wrap; }
     .answer h2 { font-size: .95rem; margin: 0; }
     .answer p { margin: 6px 0 0; line-height: 1.45; color: #dee5ef; }
+    .answer ul { margin: 6px 0 0; padding-inline-start: 22px; line-height: 1.45; }
     .answer small { display: block; margin-top: 6px; color: #a8b1c0; }
     .answer-badge { font-size: .76rem; color: #b4c8e5; }
     .answer[data-status="offline"] .answer-badge,
@@ -194,6 +195,16 @@
       detail.dir = 'auto';
       detail.textContent = card.detail;
       answer.append(heading, detail);
+      if (card.options?.length) {
+        const list = document.createElement('ul');
+        for (const option of card.options) {
+          const item = document.createElement('li');
+          item.dir = 'auto';
+          item.textContent = option;
+          list.append(item);
+        }
+        answer.append(list);
+      }
       if (card.status === 'accepted') {
         const note = document.createElement('small');
         note.textContent = 'Device state has not been verified.';

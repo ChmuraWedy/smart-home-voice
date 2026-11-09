@@ -160,3 +160,76 @@ def test_numbered_light_follow_up_uses_recent_matches(monkeypatch):
         ]
 
     asyncio.run(run())
+
+
+def test_model_clarification_lists_permitted_options_before_any_command(monkeypatch):
+    def device(name, room, home, path, channels=None):
+        return {
+            "name": name, "room": room, "home": home, "path": path,
+            "room_key": (home, room), "channels": channels or {}, "capabilities": {},
+        }
+
+    catalog = {
+        "1": device("Desk lamp", "Study", "Home", "devices/1"),
+        "2": device("Desk lamp", "Bedroom", "Home", "devices/2"),
+        "3": device("Wall switch", "Study", "Annex", "devices/3", {"switch_1": "Desk"}),
+    }
+    assert any(tool["name"] == "ask_clarification" for tool in voice.TOOLS)
+
+    def backend_request(request):
+        assert request.method == "GET" and request.url.path == "/api/v1/accounts/me"
+        return httpx.Response(200)
+
+    def dashboard_api(key):
+        return httpx.AsyncClient(
+            base_url="http://dashboard.test/api/v1/",
+            transport=httpx.MockTransport(backend_request),
+        )
+
+    async def load_catalog(*args, **kwargs):
+        return catalog
+
+    async def interpret(text, key, available, previous, history):
+        return [
+            {
+                "name": "set_device_control",
+                "arguments": json.dumps({"device_ids": ["1"], "capability": "power", "value": False, "format": "value"}),
+            },
+            {
+                "name": "ask_clarification",
+                "arguments": json.dumps({
+                    "scope": "device",
+                    "question": "Which lamp did you mean?",
+                    "candidates": [
+                        {"device_id": ident, "channel": None} for ident in ("1", "2", "unknown", "2")
+                    ],
+                }),
+            },
+        ]
+
+    monkeypatch.setattr(voice, "dashboard_api", dashboard_api)
+    monkeypatch.setattr(voice, "load_catalog", load_catalog)
+    monkeypatch.setattr(voice, "interpret", interpret)
+
+    async def run():
+        conversation = Conversation()
+        reply = await voice.answer_command("turn off the desk lamp", "model-key", conversation, DELEGATED)
+        assert reply["cards"] == [{
+            "title": "Home Voice", "detail": "Which lamp did you mean?", "status": "clarify",
+            "options": ("Desk lamp (Study · Home)", "Desk lamp (Bedroom · Home)"),
+        }]
+        assert "Desk lamp (Bedroom · Home)" in reply["message"]
+        assert conversation.targets == ()
+
+        rooms = await voice.execute(None, catalog, {
+            "name": "room_lights", "arguments": '{"room":"Study","home":null,"on":false}',
+        })
+        assert rooms[0].options == ("Study · Home", "Study · Annex")
+
+        channels = voice.clarification(catalog, "Which channel?", "channel", [
+            {"device_id": "3", "channel": "switch_1"},
+            {"device_id": "3", "channel": "switch_9"},
+        ])
+        assert channels.options == ("Wall switch · Desk (Study · Annex)",)
+
+    asyncio.run(run())

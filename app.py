@@ -27,7 +27,7 @@ from pydantic import BaseModel, Field
 from websockets.exceptions import WebSocketException
 
 from chat_session import MAX_TURNS, Conversation, EmbedSession, Sessions
-from controls import TOOLS, Answer, execute, load_catalog, model_catalog, result_json
+from controls import TOOLS, Answer, clarification, execute, load_catalog, model_catalog, result_json
 from live import StreamError, stream_transcript
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
@@ -216,15 +216,20 @@ async def interpret(transcript, key, catalog, previous, history):
                 "against the recent targets before considering the rest of the catalog. If exactly "
                 "one recent target matches, use it even when other rooms have the same number. "
                 "Treat check or check again as a status read, regardless of the previous operation. "
-                "Ask for clarification if multiple recent targets still match. If the user answers a "
-                "clarification for a status read with a device name, finish that status read. "
-                "Keep the exact previous "
+                "If several permitted options still match, call ask_clarification once. Include every "
+                "matching catalog option, including matching devices that are currently offline. "
+                "For a room choice, include one representative device ID per matching room and home. "
+                "For channels, use the advertised switch_N codes. Ask one focused question; the app "
+                "will list the options by name. Also use ask_clarification when a required detail is "
+                "missing; include relevant catalog options when available, otherwise use an empty list. "
+                "Wait for the answer before sending a device command. If the user answers a clarification "
+                "for a status read with a device name, finish that status read. Keep the exact previous "
                 "channel when it applies. An explicitly named new target takes precedence. "
                 "When there is no relevant prior context, the same number in multiple rooms is ambiguous. "
                 "An imperative to turn something on or off or change a setting is a write request, "
                 "in any language. Never substitute a status check for a requested change. "
-                "Use explain_no_action when the request is unclear, unsupported, or missing a "
-                "device or value. Do not combine it with device operations. "
+                "Use explain_no_action only when the target does not exist or the requested control "
+                "is unsupported. Never combine a clarification or explanation with device operations. "
                 "For each distinct capability issue a separate call. Use format=percent for explicit "
                 "percentages and format=value for Boolean, enum, HSV or exact API-unit values. "
                 "Cloud numeric metadata is in raw ticks; convert using cloud_scale when the units are "
@@ -382,6 +387,9 @@ def chat_result(transcript, cards, *, status_only=False):
         f"{card.title}: {card.detail}" if card.title != "Home Voice" else card.detail
         for card in cards
     ]
+    for index, card in enumerate(cards):
+        if card.options:
+            spoken[index] += " Options: " + ", ".join(card.options) + "."
     if status_only:
         spoken.insert(0, "Status check only. No device command was sent.")
     return {"transcript": transcript, "message": " ".join(spoken), "cards": [asdict(card) for card in cards]}
@@ -434,9 +442,9 @@ async def answer_command(transcript, key, conversation, delegated_key):
             previous = previous_targets(conversation, catalog)
             matches = recent_light_check(transcript, catalog, previous)
             if len(matches) > 1:
-                names = ", ".join(catalog[ident]["name"] for ident, _ in matches)
-                return chat_result(transcript, [Answer(
-                    "Home Voice", f"Which light did you mean? Recent matches: {names}.", "clarify",
+                return chat_result(transcript, [clarification(
+                    catalog, "Which light did you mean?", "device",
+                    [{"device_id": ident, "channel": None} for ident, _ in matches],
                 )])
             if matches:
                 ident, channel = matches[0]
@@ -454,13 +462,16 @@ async def answer_command(transcript, key, conversation, delegated_key):
             return chat_result(transcript, [Answer(
                 "Home Voice", "Name a device or channel and ask for status, aliases, or a change.", "clarify",
             )])
+        for reply_tool in ("ask_clarification", "explain_no_action"):
+            reply = next((call for call in calls if call["name"] == reply_tool), None)
+            if reply:
+                calls = [reply]
+                break
         if len(calls) > 8:
             return chat_result(transcript, [Answer("Home Voice", "Ask for fewer changes at a time.", "clarify")])
 
         call_names = [call["name"] for call in calls]
         logger.info("Voice request selected tools: %s", ", ".join(call_names))
-        if "explain_no_action" in call_names:
-            calls = [call for call in calls if call["name"] == "explain_no_action"][:1]
         cards = []
         selected = []
         status_only = True
