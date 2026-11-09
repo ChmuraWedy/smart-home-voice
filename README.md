@@ -128,3 +128,13 @@ Put `voice.crt`, `voice.key`, `password`, `openai-key`, and `backend-token`
 in the secrets directory. The container runs as UID/GID 10001, which needs read
 access to the files and search access to the directory. Keep the TLS CA private
 key outside that directory. Open the Dell's HTTPS address on port 8011.
+
+### Dashboard embed
+
+Use a separate Home Voice instance with `VOICE_DASHBOARD_ORIGIN` set to the exact
+dashboard origin (space-separate multiple origins) and `VOICE_BACKEND_URL` set to that dashboard's API. Serve
+`/embed` over HTTPS. Set the dashboard API's `SMART_HOME_AI_CHAT_EMBED_URL` to
+this address. The embed exchanges a one-time ticket for a session with the
+dashboard user's permissions. The embed instance needs the OpenAI key and TLS
+files. A standalone Home Voice password and backend token are unnecessary for
+this instance. The panel starts a new conversation on each open.

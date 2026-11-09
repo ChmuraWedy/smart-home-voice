@@ -11,6 +11,8 @@ from urllib.parse import quote
 
 import httpx
 
+from chat_session import ClarificationOption
+
 CHANNEL = re.compile(r"switch_[1-9][0-9]*")
 SCALAR_TYPES = {"boolean", "integer", "number", "string"}
 AUTO_CONTROL_CATEGORIES = {"dj", "dd", "kg", "cz"}
@@ -24,6 +26,7 @@ class Answer:
     title: str
     detail: str
     status: str = "info"
+    options: tuple[ClarificationOption, ...] = ()
 
 
 def tool(name, description, properties):
@@ -44,10 +47,22 @@ HSV = {
     "required": ["h", "s", "v"], "additionalProperties": False,
 }
 TOOLS = [
+    tool("ask_clarification", "Ask one question before acting. Include every matching catalog option.", {
+        "question": {"type": "string"},
+        "scope": {"type": "string", "enum": ["device", "channel", "room", "other"]},
+        "candidates": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "device_id": {"type": "string"},
+                "channel": {"type": ["string", "null"]},
+            },
+            "required": ["device_id", "channel"],
+            "additionalProperties": False,
+        }},
+    }),
     tool("explain_no_action", "Report why no device operation can be safely selected.", {
         "reason": {"type": "string", "enum": [
-            "unclear_request", "device_not_found", "ambiguous_target",
-            "unsupported_control", "missing_value",
+            "device_not_found", "unsupported_control",
         ]},
     }),
     tool("room_lights", "Read or set the lights in one exact Smart Life room; null reads power.", {
@@ -181,13 +196,13 @@ async def fetch_cloud(backend, auto_tuya):
     return result_json(await backend.get("cloud/devices", params=params, timeout=5))
 
 
-async def room_placements(backend):
+async def room_placements(backend, *, allow_sync=True):
     global _last_topology_sync
     try:
         topology = result_json(await backend.get("cloud/topology"))
         timestamp = topology.get("synced_at")
         stale = not timestamp or (datetime.now(timezone.utc) - datetime.fromisoformat(timestamp)).days >= 1
-        if (stale and topology["job"]["status"] != "running"
+        if (allow_sync and stale and topology["job"]["status"] != "running"
                 and time.monotonic() - _last_topology_sync >= AUTO_REFRESH_INTERVAL):
             _last_topology_sync = time.monotonic()
             await backend.post("cloud/topology/sync", timeout=4)
@@ -219,9 +234,11 @@ def apply_room(device, remote, placement, room_names):
     )
 
 
-async def load_catalog(backend, labels, cloud_ids, cloud_labels=None, *, auto_tuya=False):
+async def load_catalog(backend, labels, cloud_ids, cloud_labels=None, *, auto_tuya=False, delegated=False):
     cloud_labels = cloud_labels or {}
-    rows = result_json(await backend.get("devices")) if labels else []
+    rows = result_json(await backend.get("devices")) if labels or delegated else []
+    if delegated:
+        labels = {str(row["id"]): labels.get(str(row["id"]), row["name"]) for row in rows}
     try:
         cloud = {row["id"]: row for row in await fetch_cloud(backend, auto_tuya)}
     except (httpx.HTTPError, ValueError):
@@ -233,7 +250,7 @@ async def load_catalog(backend, labels, cloud_ids, cloud_labels=None, *, auto_tu
     }
     await asyncio.gather(*(refresh_cloud_definitions(backend, cloud[ident])
                            for ident in cloud_targets if ident in cloud))
-    placements = await room_placements(backend) if auto_tuya and cloud else {}
+    placements = await room_placements(backend, allow_sync=not delegated) if auto_tuya and cloud else {}
     room_names = {placement[2].casefold() for placement in placements.values()}
     catalog = {}
     for row in rows:
@@ -407,6 +424,34 @@ def power_code(device):
                 power[0] if len(power) == 1 else "power")
 
 
+def clarification(catalog, question, scope, candidates, *, read_only=False):
+    options = []
+    for candidate in candidates:
+        device = catalog.get(candidate["device_id"])
+        if device is None:
+            continue
+        room, home = device.get("room"), device.get("home")
+        location = " · ".join(part for part in (room, home) if part)
+        if scope == "room":
+            if room and device.get("room_key"):
+                options.append(ClarificationOption(location, room_key=device["room_key"]))
+            continue
+        if scope == "other":
+            continue
+        name = device["name"]
+        channel = candidate["channel"] if scope == "channel" or read_only else None
+        if scope == "channel":
+            if not channel or not CHANNEL.fullmatch(channel):
+                continue
+            if channel not in device["channels"] and channel not in device["capabilities"]:
+                continue
+            label = device["channels"].get(channel) or f"Channel {channel.split('_')[1]}"
+            name = f"{name} · {label}"
+        label = f"{name} ({location})" if location else name
+        options.append(ClarificationOption(label, path=device["path"], channel=channel, read_only=read_only))
+    return Answer("Home Voice", question, "clarify", tuple(dict.fromkeys(options)))
+
+
 async def room_lights(backend, catalog, args, selected):
     room, home, on = args["room"], args["home"], args["on"]
     if not isinstance(room, str) or (home is not None and not isinstance(home, str)):
@@ -414,13 +459,15 @@ async def room_lights(backend, catalog, args, selected):
     if on is not None and type(on) is not bool:
         raise ValueError("Invalid power value")
     candidates = [
-        device for device in catalog.values()
+        (ident, device) for ident, device in catalog.items()
         if device.get("room", "").casefold() == room.strip().casefold()
         and (home is None or device["home"].casefold() == home.strip().casefold())
     ]
-    if len({device["room_key"] for device in candidates}) > 1:
-        return [Answer(room, "More than one room matches. Include the home name.", "clarify")]
-    devices = [device for device in candidates if device["room_light"]]
+    if len({device["room_key"] for _, device in candidates}) > 1:
+        return [clarification(catalog, "Which room did you mean?", "room", [
+            {"device_id": ident, "channel": None} for ident, _ in candidates
+        ])]
+    devices = [device for _, device in candidates if device["room_light"]]
     if not devices:
         return [Answer(room, "No lights found in this Smart Life room.", "unavailable")]
     selected.extend((device["path"], None) for device in devices)
@@ -463,15 +510,14 @@ async def execute(backend, catalog, call, *, selected=None):
     args = json.loads(call["arguments"])
     if selected is None:
         selected = []
+    if name == "ask_clarification":
+        return [clarification(catalog, args["question"], args["scope"], args["candidates"])]
     if name == "explain_no_action":
         reasons = {
-            "unclear_request": "I couldn't tell what you wanted the device to do.",
             "device_not_found": "I couldn't find the named device or room in Smart Life.",
-            "ambiguous_target": "More than one device or room matches. Say the full name.",
             "unsupported_control": "The device doesn't expose that control to Home Voice.",
-            "missing_value": "Say the setting you want, such as on, off, or a brightness percentage.",
         }
-        return [Answer("Home Voice", f"No command sent. {reasons[args['reason']]}", "clarify")]
+        return [Answer("Home Voice", f"No command sent. {reasons[args['reason']]}", "unavailable")]
     if name == "room_lights":
         return await room_lights(backend, catalog, args, selected)
     ids = args["device_ids"]
