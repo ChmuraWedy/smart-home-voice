@@ -9,10 +9,26 @@ MAX_SESSIONS = 256
 MAX_TURNS = 80
 
 
+@dataclass(frozen=True)
+class ClarificationOption:
+    label: str
+    path: str | None = None
+    room_key: tuple | None = None
+    channel: str | None = None
+    read_only: bool = False
+
+
+@dataclass
+class PendingClarification:
+    transcript: str
+    choices: dict[str, ClarificationOption] = field(default_factory=dict)
+
+
 @dataclass
 class Conversation:
     turns: list[dict[str, str]] = field(default_factory=list)
     targets: tuple = ()
+    pending: PendingClarification | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 

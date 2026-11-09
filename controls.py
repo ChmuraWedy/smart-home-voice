@@ -11,6 +11,8 @@ from urllib.parse import quote
 
 import httpx
 
+from chat_session import ClarificationOption
+
 CHANNEL = re.compile(r"switch_[1-9][0-9]*")
 SCALAR_TYPES = {"boolean", "integer", "number", "string"}
 AUTO_CONTROL_CATEGORIES = {"dj", "dd", "kg", "cz"}
@@ -24,7 +26,7 @@ class Answer:
     title: str
     detail: str
     status: str = "info"
-    options: tuple[str, ...] = ()
+    options: tuple[ClarificationOption, ...] = ()
 
 
 def tool(name, description, properties):
@@ -422,7 +424,7 @@ def power_code(device):
                 power[0] if len(power) == 1 else "power")
 
 
-def clarification(catalog, question, scope, candidates):
+def clarification(catalog, question, scope, candidates, *, read_only=False):
     options = []
     for candidate in candidates:
         device = catalog.get(candidate["device_id"])
@@ -431,21 +433,22 @@ def clarification(catalog, question, scope, candidates):
         room, home = device.get("room"), device.get("home")
         location = " · ".join(part for part in (room, home) if part)
         if scope == "room":
-            if room:
-                options.append(location)
+            if room and device.get("room_key"):
+                options.append(ClarificationOption(location, room_key=device["room_key"]))
             continue
         if scope == "other":
             continue
         name = device["name"]
+        channel = candidate["channel"] if scope == "channel" or read_only else None
         if scope == "channel":
-            channel = candidate["channel"]
             if not channel or not CHANNEL.fullmatch(channel):
                 continue
             if channel not in device["channels"] and channel not in device["capabilities"]:
                 continue
             label = device["channels"].get(channel) or f"Channel {channel.split('_')[1]}"
             name = f"{name} · {label}"
-        options.append(f"{name} ({location})" if location else name)
+        label = f"{name} ({location})" if location else name
+        options.append(ClarificationOption(label, path=device["path"], channel=channel, read_only=read_only))
     return Answer("Home Voice", question, "clarify", tuple(dict.fromkeys(options)))
 
 

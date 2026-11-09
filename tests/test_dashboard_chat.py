@@ -5,7 +5,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 import app as voice
-from chat_session import Conversation, Sessions
+from chat_session import Conversation, EmbedSession, Sessions
 
 TICKET = "t" * 43
 DELEGATED = "shc_" + "s" * 43
@@ -45,7 +45,7 @@ def test_ticket_auth_and_full_conversation_per_panel(monkeypatch):
         assert kwargs["delegated"]
         return {"1": {"path": "devices/1"}}
 
-    async def interpret(text, key, catalog, previous, history):
+    async def interpret(text, key, catalog, previous, history, *, choice=None):
         conversations.append((text, list(history)))
         return []
 
@@ -113,7 +113,7 @@ def test_numbered_light_follow_up_uses_recent_matches(monkeypatch):
     async def load_catalog(*args, **kwargs):
         return catalog
 
-    async def interpret(text, key, available, previous, history):
+    async def interpret(text, key, available, previous, history, *, choice=None):
         model_requests.append(text)
         if text != first:
             return []
@@ -145,8 +145,9 @@ def test_numbered_light_follow_up_uses_recent_matches(monkeypatch):
         assert "Kitchen Light 2" not in reply["message"]
         assert command_calls == [("set_device_control", ["1", "2", "3"])]
 
-        del catalog["3"]
-        reply = await voice.answer_command(follow_up, "model-key", conversation, DELEGATED)
+        choice = reply["cards"][0]["options"][0]["id"]
+        reply = await voice.run_command("", "model-key", EmbedSession(DELEGATED, conversation), choice_id=choice)
+        assert reply["transcript"] == "Selected: WorkRoomLamp2"
         assert reply["cards"][0]["title"] == "WorkRoomLamp2"
         assert command_calls[-1] == ("get_device_status", ["2"])
         assert reply["message"].startswith("Status check only.")
@@ -189,7 +190,7 @@ def test_model_clarification_lists_permitted_options_before_any_command(monkeypa
     async def load_catalog(*args, **kwargs):
         return catalog
 
-    async def interpret(text, key, available, previous, history):
+    async def interpret(text, key, available, previous, history, *, choice=None):
         return [
             {
                 "name": "set_device_control",
@@ -214,22 +215,106 @@ def test_model_clarification_lists_permitted_options_before_any_command(monkeypa
     async def run():
         conversation = Conversation()
         reply = await voice.answer_command("turn off the desk lamp", "model-key", conversation, DELEGATED)
-        assert reply["cards"] == [{
-            "title": "Home Voice", "detail": "Which lamp did you mean?", "status": "clarify",
-            "options": ("Desk lamp (Study · Home)", "Desk lamp (Bedroom · Home)"),
-        }]
+        card, = reply["cards"]
+        assert card["title"] == "Home Voice"
+        assert card["detail"] == "Which lamp did you mean?"
+        assert card["status"] == "clarify"
+        assert [option["label"] for option in card["options"]] == [
+            "Desk lamp (Study · Home)", "Desk lamp (Bedroom · Home)",
+        ]
         assert "Desk lamp (Bedroom · Home)" in reply["message"]
         assert conversation.targets == ()
 
         rooms = await voice.execute(None, catalog, {
             "name": "room_lights", "arguments": '{"room":"Study","home":null,"on":false}',
         })
-        assert rooms[0].options == ("Study · Home", "Study · Annex")
+        assert [option.label for option in rooms[0].options] == ["Study · Home", "Study · Annex"]
 
         channels = voice.clarification(catalog, "Which channel?", "channel", [
             {"device_id": "3", "channel": "switch_1"},
             {"device_id": "3", "channel": "switch_9"},
         ])
-        assert channels.options == ("Wall switch · Desk (Study · Annex)",)
+        assert [option.label for option in channels.options] == ["Wall switch · Desk (Study · Annex)"]
 
     asyncio.run(run())
+
+
+def test_click_resumes_original_command_once_for_selected_channel(monkeypatch):
+    session_store = Sessions()
+    monkeypatch.setattr(voice, "embedded_conversations", session_store)
+    monkeypatch.setattr(voice, "secret", lambda name: "model-test-key" if name == "OPENAI_API_KEY" else None)
+    key = session_store.open(DELEGATED)
+    headers = {**HEADERS, "Authorization": "Bearer " + key}
+    other_headers = {**HEADERS, "Authorization": "Bearer " + session_store.open(DELEGATED)}
+    original = "turn off the switch"
+    writes = []
+    catalog = {
+        "1": {
+            "name": "Wall switch", "path": "devices/42", "cloud": False,
+            "channels": {"switch_1": "Desk", "switch_2": "Ceiling"},
+            "capabilities": {
+                code: {"type": "boolean", "writable": True, "readable": True}
+                for code in ("switch_1", "switch_2")
+            },
+        },
+    }
+
+    def backend_request(request):
+        assert request.headers["X-API-Key"] == DELEGATED
+        if request.url.path == "/api/v1/accounts/me" and request.method == "GET":
+            return httpx.Response(200)
+        assert request.url.path == "/api/v1/devices/42/commands/capabilities" and request.method == "POST"
+        writes.append(json.loads(request.content))
+        return httpx.Response(200, json={"acknowledged": True})
+
+    def dashboard_api(key):
+        return httpx.AsyncClient(
+            base_url="http://dashboard.test/api/v1/",
+            transport=httpx.MockTransport(backend_request),
+            headers={"X-API-Key": key},
+        )
+
+    async def load_catalog(*args, **kwargs):
+        return catalog
+
+    async def interpret(text, key, available, previous, history, *, choice=None):
+        assert text == original
+        if choice:
+            assert choice == {"label": "Wall switch · Ceiling", "channel": "switch_2"}
+            assert set(available) == {"1"}
+            return [{
+                "name": "set_device_control",
+                "arguments": json.dumps({"device_ids": ["1"], "capability": "power", "value": False, "format": "value"}),
+            }]
+        return [{
+            "name": "ask_clarification",
+            "arguments": json.dumps({
+                "scope": "channel", "question": "Which channel should I turn off?",
+                "candidates": [{"device_id": "1", "channel": code} for code in ("switch_1", "switch_2")],
+            }),
+        }]
+
+    monkeypatch.setattr(voice, "dashboard_api", dashboard_api)
+    monkeypatch.setattr(voice, "load_catalog", load_catalog)
+    monkeypatch.setattr(voice, "interpret", interpret)
+    path = "/embed/command"
+    with TestClient(voice.app) as client:
+        ask = client.post(path, headers=headers, json={"text": original})
+        assert ask.status_code == 200
+        first, second = ask.json()["cards"][0]["options"]
+        assert writes == []
+        assert client.post(path, headers=other_headers, json={"choice": second["id"]}).status_code == 409
+        assert client.post(path, headers=headers, json={"choice": second["id"], "text": "turn everything on"}).status_code == 400
+        result = client.post(path, headers=headers, json={"choice": second["id"]})
+        assert result.status_code == 200, result.text
+        assert result.json()["transcript"] == "Selected: Wall switch · Ceiling"
+        assert result.json()["cards"][0]["status"] == "accepted"
+        assert writes == [{"values": {"switch_2": False}}]
+        assert client.post(path, headers=headers, json={"choice": second["id"]}).status_code == 409
+        assert client.post(path, headers=headers, json={"choice": first["id"]}).status_code == 409
+
+        ask = client.post(path, headers=headers, json={"text": original})
+        stale = ask.json()["cards"][0]["options"][1]["id"]
+        client.post(path, headers=headers, json={"text": original})
+        assert client.post(path, headers=headers, json={"choice": stale}).status_code == 409
+        assert writes == [{"values": {"switch_2": False}}]

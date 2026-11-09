@@ -7,7 +7,6 @@ import os
 import re
 import secrets
 import time
-from dataclasses import asdict
 from pathlib import Path
 from typing import Annotated
 from urllib.parse import urlsplit
@@ -26,7 +25,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field
 from websockets.exceptions import WebSocketException
 
-from chat_session import MAX_TURNS, Conversation, EmbedSession, Sessions
+from chat_session import MAX_TURNS, Conversation, EmbedSession, PendingClarification, Sessions
 from controls import TOOLS, Answer, clarification, execute, load_catalog, model_catalog, result_json
 from live import StreamError, stream_transcript
 
@@ -185,7 +184,12 @@ async def transcribe(audio, media_type, key):
         ))["text"].strip()
 
 
-async def interpret(transcript, key, catalog, previous, history):
+async def interpret(transcript, key, catalog, previous, history, *, choice=None):
+    selection = (
+        "The user clicked a clarification option for the current request. The latest message is the "
+        "original request. Continue that same action, with the same settings, only on the selected option. "
+        f"Selection: {json.dumps(choice, ensure_ascii=False)}. "
+    ) if choice else ""
     async with httpx.AsyncClient(
         base_url="https://api.openai.com/v1/",
         headers={"Authorization": f"Bearer {key}"},
@@ -234,6 +238,7 @@ async def interpret(transcript, key, catalog, previous, history):
                 "percentages and format=value for Boolean, enum, HSV or exact API-unit values. "
                 "Cloud numeric metadata is in raw ticks; convert using cloud_scale when the units are "
                 "explicit and the mapping is known. HSV uses h=0..360, s/v=0..1000. "
+                f"{selection}"
                 f"Previous targets in this tab: {json.dumps(previous)}. "
                 f"Catalog: {json.dumps(model_catalog(catalog), ensure_ascii=False)}"
             ),
@@ -365,9 +370,17 @@ async def process_command(request: Request, context):
         body.extend(chunk)
     if typed:
         try:
-            transcript = json.loads(body)["text"].strip()
-        except (ValueError, TypeError, KeyError, AttributeError):
+            message = json.loads(body)
+        except ValueError:
             raise HTTPException(400, "Enter a text command.") from None
+        if isinstance(message, dict) and "choice" in message:
+            choice_id = message["choice"]
+            valid_id = isinstance(choice_id, str) and re.fullmatch(r"[A-Za-z0-9_-]{22}", choice_id)
+            if set(message) != {"choice"} or not valid_id:
+                raise HTTPException(400, "Select an option from the current clarification.")
+            return await run_command("", key, context, choice_id=choice_id)
+        text = message.get("text") if isinstance(message, dict) else None
+        transcript = text.strip() if isinstance(text, str) else ""
         if not 0 < len(transcript) <= 1000:
             raise HTTPException(400, "Enter a message between 1 and 1000 characters.")
     else:
@@ -382,35 +395,81 @@ async def process_command(request: Request, context):
     return await run_command(transcript, key, context)
 
 
-def chat_result(transcript, cards, *, status_only=False):
-    spoken = [
-        f"{card.title}: {card.detail}" if card.title != "Home Voice" else card.detail
-        for card in cards
-    ]
-    for index, card in enumerate(cards):
+def chat_result(transcript, cards, *, status_only=False, conversation=None):
+    spoken = []
+    rendered = []
+    for card in cards:
+        message = f"{card.title}: {card.detail}" if card.title != "Home Voice" else card.detail
+        options = []
         if card.options:
-            spoken[index] += " Options: " + ", ".join(card.options) + "."
+            message += " Options: " + ", ".join(option.label for option in card.options) + "."
+            if conversation is not None:
+                if conversation.pending is None:
+                    conversation.pending = PendingClarification(transcript)
+                for option in card.options:
+                    ident = secrets.token_urlsafe(16)
+                    conversation.pending.choices[ident] = option
+                    options.append({"id": ident, "label": option.label})
+        spoken.append(message)
+        rendered.append({"title": card.title, "detail": card.detail, "status": card.status, "options": options})
     if status_only:
         spoken.insert(0, "Status check only. No device command was sent.")
-    return {"transcript": transcript, "message": " ".join(spoken), "cards": [asdict(card) for card in cards]}
+    return {"transcript": transcript, "message": " ".join(spoken), "cards": rendered}
 
 
-async def run_command(transcript, key, context):
+async def run_command(transcript, key, context, *, choice_id=None):
     delegated = isinstance(context, EmbedSession)
     conversation = context.conversation if delegated else context
     async with conversation.lock:
         if len(conversation.turns) >= 2 * MAX_TURNS:
             raise HTTPException(409, "This conversation is full. Reopen AI chat to start a new one.")
-        result = await answer_command(transcript, key, conversation, context.dashboard_key if delegated else None)
+        choice = None
+        if choice_id:
+            pending = conversation.pending
+            if not pending or choice_id not in pending.choices:
+                raise HTTPException(409, "This choice has expired. Ask your question again.")
+            choice = pending.choices[choice_id]
+            transcript = pending.transcript
+        conversation.pending = None
+        result = await answer_command(transcript, key, conversation, context.dashboard_key if delegated else None, choice=choice)
         if transcript:
+            display_text = f"Selected: {choice.label}" if choice else transcript
+            result["transcript"] = display_text
             conversation.turns.extend([
-                {"role": "user", "content": transcript},
+                {"role": "user", "content": display_text},
                 {"role": "assistant", "content": result["message"]},
             ])
         return result
 
 
-async def answer_command(transcript, key, conversation, delegated_key):
+def chosen_catalog(catalog, choice):
+    if choice.room_key is not None:
+        return {ident: device for ident, device in catalog.items() if device.get("room_key") == choice.room_key}
+    return {ident: device for ident, device in catalog.items() if device["path"] == choice.path}
+
+
+def bind_choice(call, choice, catalog):
+    if choice is None or call["name"] in {"ask_clarification", "explain_no_action"}:
+        return call
+    name = call["name"]
+    args = json.loads(call["arguments"])
+    if not isinstance(args, dict):
+        raise ValueError("Invalid tool arguments")
+    if name == "room_lights":
+        if choice.room_key is None:
+            raise ValueError("The choice is a single device")
+        room_device = next(iter(catalog.values()))
+        args.update(room=room_device["room"], home=room_device["home"])
+    elif choice.channel:
+        if name not in {"get_device_status", "set_device_control"}:
+            raise ValueError("The choice is a single channel")
+        if args["capability"] not in {None, "power", choice.channel}:
+            raise ValueError("The command targets another channel")
+        args["capability"] = choice.channel
+    return {**call, "arguments": json.dumps(args)}
+
+
+async def answer_command(transcript, key, conversation, delegated_key, *, choice=None):
     if not transcript:
         return chat_result("", [Answer("Home Voice", "No speech detected. Try again.", "clarify")])
     try:
@@ -439,13 +498,21 @@ async def answer_command(transcript, key, conversation, delegated_key):
             catalog = await load_catalog(
                 backend, labels, cloud_ids, cloud_labels, auto_tuya=auto_tuya, delegated=bool(delegated_key),
             )
+            if choice:
+                catalog = chosen_catalog(catalog, choice)
+                if not catalog:
+                    raise HTTPException(409, "That option is no longer available. Ask your question again.")
             previous = previous_targets(conversation, catalog)
-            matches = recent_light_check(transcript, catalog, previous)
+            if choice and choice.read_only:
+                matches = [(next(iter(catalog)), choice.channel)]
+            else:
+                matches = [] if choice else recent_light_check(transcript, catalog, previous)
             if len(matches) > 1:
                 return chat_result(transcript, [clarification(
                     catalog, "Which light did you mean?", "device",
-                    [{"device_id": ident, "channel": None} for ident, _ in matches],
-                )])
+                    [{"device_id": ident, "channel": channel} for ident, channel in matches],
+                    read_only=True,
+                )], conversation=conversation)
             if matches:
                 ident, channel = matches[0]
                 calls = [{
@@ -453,7 +520,8 @@ async def answer_command(transcript, key, conversation, delegated_key):
                     "arguments": json.dumps({"device_ids": [ident], "capability": channel}),
                 }]
             else:
-                calls = await interpret(transcript, key, catalog, previous, conversation.turns)
+                selection = {"label": choice.label, "channel": choice.channel} if choice else None
+                calls = await interpret(transcript, key, catalog, previous, conversation.turns, choice=selection)
         except (httpx.HTTPError, ValueError, TypeError, KeyError, AttributeError):
             raise HTTPException(502, "Could not load the device catalog or interpret the recording.") from None
         if not catalog:
@@ -472,6 +540,13 @@ async def answer_command(transcript, key, conversation, delegated_key):
 
         call_names = [call["name"] for call in calls]
         logger.info("Voice request selected tools: %s", ", ".join(call_names))
+        if choice:
+            try:
+                calls = [bind_choice(call, choice, catalog) for call in calls]
+            except (ValueError, TypeError, KeyError):
+                return chat_result(transcript, [Answer(
+                    "Home Voice", "I couldn't apply that request to the selected option.", "clarify",
+                )])
         cards = []
         selected = []
         status_only = True
@@ -487,4 +562,4 @@ async def answer_command(transcript, key, conversation, delegated_key):
                 cards.append(Answer("Home Voice", "Could not match a request to a device or control.", "clarify"))
         if selected:
             conversation.targets = tuple(dict.fromkeys(selected))
-    return chat_result(transcript, cards, status_only=status_only)
+    return chat_result(transcript, cards, status_only=status_only, conversation=conversation)
